@@ -648,7 +648,11 @@ def main():
     if a[:1] and a[0] in ("-h", "--help", "help"):
         print(__doc__)
         return 0
-    seed_config()   # first run: create ~/.config/session-keeper/config from the starter (never changes it)
+    # First real run: create ~/.config/session-keeper/config from the starter (never changes it).
+    # --help, --dry-run and a usage error write nothing.
+    if "--dry-run" not in a and ("--reopen" in a or (a[:1] == ["--notify"] and len(a) == 2)
+                                 or a in ([], ["--post-boot"], ["--warn"], ["--auto"])):
+        seed_config()
     if "--reopen" in a:
         if "--file" in a:
             i = a.index("--file")

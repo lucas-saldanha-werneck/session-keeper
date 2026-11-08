@@ -96,7 +96,7 @@ Requires Python 3.8+ and bash.
 ## Your settings
 
 Your settings are in `~/.config/session-keeper/config` (or `$SESSION_KEEPER_CONFIG`; `$XDG_CONFIG_HOME` is
-respected). You do not have to create it: the first time the plugin starts a session, or `claude-save` runs,
+respected). You do not have to create it: the first time the plugin starts a session, or `claude-save` really runs (`--help` and `--dry-run` write nothing),
 it is created from [`config.example`](config.example), which lists every option with its default, commented
 out, so it changes nothing until you edit a line. A file that already exists is never changed, and plugin
 updates or a new `install.sh` never touch it.

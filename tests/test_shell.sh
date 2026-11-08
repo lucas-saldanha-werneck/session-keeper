@@ -212,6 +212,8 @@ out2="$("$T/home/.local/bin/claude-save" --dry-run 2>&1)"
 has "installed claude-save runs from its symlink (finds lib/)" "dry-run: nothing saved" "$out2"
 SEEDED="$T/seeded/session-keeper/config"
 SESSION_KEEPER_CONFIG="$SEEDED" "$T/home/.local/bin/claude-save" --dry-run >/dev/null 2>&1
+[[ ! -e "$SEEDED" ]] && ok "installed claude-save --dry-run does not create the config" || bad "--dry-run created the config"
+SESSION_KEEPER_CONFIG="$SEEDED" "$T/home/.local/bin/claude-save" --reopen --file "$T/no-such-save.json" >/dev/null 2>&1
 cmp -s "$SEEDED" "$ROOT/config.example" && ok "installed claude-save seeds the config from its installed starter" \
   || bad "installed claude-save seeds the config" "$(ls -la "$T/seeded/session-keeper" "$T/home/.local/share/session-keeper" 2>&1)"
 SHV="$(env -i HOME="$HOME" PATH="$PATH" bash -c '. "$1/lib/sk_config.sh"; before="$(export -p)"; sk_load_config "$2"

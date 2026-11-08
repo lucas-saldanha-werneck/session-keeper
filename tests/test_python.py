@@ -733,6 +733,15 @@ class TestSeedConfig(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertEqual(self.bytes(self.dest), self.bytes(self.STARTER))
 
+    def test_help_and_dry_run_leave_a_missing_config_missing(self):
+        save = os.path.join(self.t, "save.json")
+        with open(save, "w") as f:
+            json.dump({"sessions": []}, f)
+        for args in (["--help"], ["help"], ["--dry-run"], ["--reopen", "--dry-run", "--file", save], ["--bogus"]):
+            subprocess.run([sys.executable, os.path.join(ROOT, "bin", "claude-save"), *args],
+                           capture_output=True, text=True, env=self.env, timeout=60)
+            self.assertFalse(os.path.exists(os.path.join(self.home, ".config")), args)
+
     def test_existing_config_is_never_changed(self):
         os.makedirs(os.path.dirname(self.dest))
         with open(self.dest, "wb") as f:
