@@ -721,6 +721,12 @@ class TestSeedConfig(unittest.TestCase):
         self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
         self.assertEqual(self.bytes(self.dest), self.bytes(self.STARTER))
 
+    @unittest.skipIf(os.name == "nt", "file modes are POSIX")
+    def test_created_file_is_private(self):
+        # It is meant to hold commands (SESSION_KEEPER_NOTIFY, _PRE_*) that may carry a token.
+        self.assertEqual(self.seed().returncode, 0)
+        self.assertEqual(os.stat(self.dest).st_mode & 0o777, 0o600)
+
     def test_claude_save_seeds_on_first_use(self):
         r = subprocess.run([sys.executable, os.path.join(ROOT, "bin", "claude-save"), "--reopen", "--file",
                             os.path.join(self.t, "no-such-save.json")], capture_output=True, text=True, env=self.env)

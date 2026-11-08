@@ -75,7 +75,7 @@ def seed_config(dest=None, starter=None):
             data = f.read()
         os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
         # O_EXCL: a file that appears between the check and here is left alone
-        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o644)
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)  # private: it may hold commands with tokens
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
