@@ -30,7 +30,10 @@ def _read_config(path):
                 v = v.strip()
                 if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
                     v = v[1:-1]
-                out[k] = os.path.expandvars(os.path.expanduser(v))
+                v = os.path.expandvars(os.path.expanduser(v))
+                if v.startswith(HOME):
+                    v = os.path.normpath(v)  # Windows: "C:\\Users\\me/x" -> "C:\\Users\\me\\x"
+                out[k] = v
     except OSError:
         pass
     return out
