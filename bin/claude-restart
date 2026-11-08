@@ -1,0 +1,443 @@
+#!/bin/bash
+# claude-restart - close a Claude Code session and reopen it at the SAME point (--resume).
+#
+# Why: config changes (settings.json, CLAUDE.md, output style, hooks, plugins, MCP servers) only load
+# in a NEW session. This swaps the session without losing the conversation.
+#
+# Why it is safe: it does NOT kill right away. It leaves a MARKER, and Claude Code's Stop hook fires
+# the restart when the session's TURN ends, so no reply or task is cut in the middle. If the session
+# does not finish a turn within N minutes (idle, or a long task), a macOS dialog asks whether to kill.
+#
+# Usage:
+#   claude-restart [folder]                   only show the plan (default: current folder)
+#   claude-restart [folder] --yes             schedule: restart at the end of the turn
+#   claude-restart [folder] --yes --wait 20   minutes before asking (default 10)
+#   claude-restart [folder] --yes --now       kill now, without waiting for the turn
+#   claude-restart --list                     tmux sessions (and their folders)
+#   claude-restart --pending                  scheduled restarts
+#   claude-restart --cancel [folder]          cancel the one scheduled for that folder
+#
+# Desktop app: run FROM INSIDE a desktop app session, the same command marks MODE=app. At the end of
+# the turn claude-restart-app stops only that session's claude process (no UI is touched); the next
+# message starts a new process with --resume of the same id.
+#
+# The Stop hook must be registered (the session-keeper plugin does it; or add
+# `claude-restart --stop-hook` as a Stop hook in ~/.claude/settings.json).
+# Internal modes: --stop-hook   --fire <file>   --watch <id> <seconds>
+# Log: ~/.claude/restart-pending/restart.log
+set -euo pipefail
+
+CONF="${SESSION_KEEPER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/session-keeper/config}"
+load_config() {  # KEY=VALUE lines; a variable already set in the environment wins
+  local line k v
+  [[ -f "$CONF" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"; line="${line#export }"
+    [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
+    [[ -n "${!k:-}" ]] && continue
+    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"; v="${v/#\~/$HOME}"
+    printf -v "$k" '%s' "$v"; export "${k?}"
+  done < "$CONF"
+}
+load_config
+
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+PROJ_ROOT="$CLAUDE_DIR/projects"
+PEND="$CLAUDE_DIR/restart-pending"
+SELF_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+BIN_DIR="$(dirname "$SELF_BIN")"
+LOG="$PEND/restart.log"
+POLL="${CLAUDE_RESTART_POLL:-5}"
+PREFIX="${SESSION_KEEPER_TMUX_PREFIX:-}"
+ITERM_APP="${SESSION_KEEPER_ITERM_APP:-/Applications/iTerm.app}"
+EXTRA_ARGS="${SESSION_KEEPER_CLAUDE_ARGS:-}"
+mkdir -p "$PEND"
+
+TMUX_BIN="${SESSION_KEEPER_TMUX:-}"
+if [[ -z "$TMUX_BIN" ]]; then
+  TMUX_BIN="$(command -v tmux 2>/dev/null || true)"
+  for c in /opt/homebrew/bin/tmux /usr/local/bin/tmux; do
+    [[ -z "$TMUX_BIN" && -x "$c" ]] && TMUX_BIN="$c"
+  done
+fi
+tmx() { [[ -n "$TMUX_BIN" ]] || return 127; "$TMUX_BIN" "$@"; }
+
+die() { printf 'claude-restart: %s\n' "$1" >&2; exit 1; }
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
+file_size() { stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null || echo 0; }
+is_macos() { [[ "$(uname -s)" == Darwin || "${SESSION_KEEPER_ASSUME_MACOS:-}" == 1 ]]; }
+
+hook_registered() {
+  grep -qE 'claude-restart[\\"]* --stop-hook' "$CLAUDE_DIR/settings.json" 2>/dev/null && return 0
+  grep -q 'session-keeper' "$CLAUDE_DIR/plugins/installed_plugins.json" 2>/dev/null && return 0
+  return 1
+}
+
+open_resume() {  # $1 = folder, $2 = resume id
+  local cmd q
+  cmd="cd $(printf '%q' "$1") && claude --resume $2${EXTRA_ARGS:+ $EXTRA_ARGS}"
+  if [[ "${CLAUDE_RESTART_DRYRUN:-}" == "1" ]]; then
+    log "DRYRUN would open: $cmd"; return 0
+  fi
+  q="${cmd//\\/\\\\}"; q="${q//\"/\\\"}"
+  if is_macos && [[ -d "$ITERM_APP" ]] && command -v osascript >/dev/null; then
+    osascript -e "tell application \"iTerm\"
+  activate
+  set w to (create window with default profile)
+  tell current session of w to write text \"$q\"
+end tell" >/dev/null && return 0
+  fi
+  if is_macos && command -v osascript >/dev/null; then
+    osascript -e "tell application \"Terminal\" to do script \"$q\"" >/dev/null && return 0
+  fi
+  if [[ -n "$TMUX_BIN" ]]; then
+    tmx new-session -d -s "claude-$(printf '%s' "$2" | cut -c1-8)" -c "$1" "$cmd" && return 0
+  fi
+  log "no terminal to reopen in; run it yourself: $cmd"
+}
+
+# ===== internal: Stop hook (runs at the END of every turn, in every session) =====
+if [[ "${1:-}" == "--stop-hook" ]]; then
+  compgen -G "$PEND/*.marker" >/dev/null || exit 0     # fast path: nothing scheduled
+  ids="$(python3 -c '
+import sys, json, os
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+t = os.path.basename(d.get("transcript_path") or "")
+if t.endswith(".jsonl"):
+    t = t[:-6]
+for x in (d.get("session_id") or "", t):
+    if x:
+        print(x)
+' 2>/dev/null || true)"
+  for id in $ids; do
+    M="$PEND/$id.marker"
+    [[ -f "$M" ]] || continue
+    F="$PEND/$id.firing"
+    mv "$M" "$F" 2>/dev/null || continue
+    if grep -qx 'MODE=app' "$F"; then
+      # Desktop app: TMUX_PANE here is STALE and points to another session. Do not use it.
+      # Record the pid of this turn's `claude` (an ancestor of the hook) and the app log position.
+      a=$PPID; cli=0
+      while [[ -n "$a" && "$a" != "0" && "$a" != "1" ]]; do
+        c="$(ps -o command= -p "$a" 2>/dev/null || true)"
+        if [[ "$c" == *"laude.app/Contents/MacOS/claude "* && "$c" != *"Helpers/disclaimer"* ]]; then cli=$a; break; fi
+        a=$(ps -o ppid= -p "$a" 2>/dev/null | tr -d ' ')
+      done
+      printf 'APP_PID=%q\n' "$cli" >> "$F"
+      printf 'MAINLOG_POS=%q\n' "$(file_size "$HOME/Library/Logs/Claude/main.log")" >> "$F"
+      log "stop-hook: turn of $id ended (app, pid $cli); firing restart"
+      nohup "$SELF_BIN" --fire "$F" >/dev/null 2>&1 & disown
+      break
+    fi
+    # Kill the tmux session where THIS turn ended, and resume THIS transcript.
+    if [[ -n "${TMUX_PANE:-}" ]]; then
+      me="$(tmx display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null || true)"
+      if [[ -n "$me" ]]; then printf 'SESSION=%q\n' "$me" >> "$F"; fi
+    fi
+    printf 'RESUME_ID=%q\n' "$id" >> "$F"
+    log "stop-hook: turn of $id ended; firing restart"
+    nohup "$SELF_BIN" --fire "$F" >/dev/null 2>&1 & disown
+    break
+  done
+  exit 0
+fi
+
+# ===== internal: fire (kill and reopen) =====
+if [[ "${1:-}" == "--fire" ]]; then
+  F="${2:-}"; [[ -f "$F" ]] || exit 0
+  SESSION=""; TARGET=""; RESUME_ID=""; MODE=""; HOST_SID=""; APP_PID=0; MAINLOG_POS=0
+  # shellcheck disable=SC1090
+  source "$F"; rm -f "$F"
+  if [[ "$MODE" == app ]]; then
+    log "fire: app $HOST_SID (resume $RESUME_ID, pid ${APP_PID:-0})"
+    exec python3 "$BIN_DIR/claude-restart-app" "$HOST_SID" "${APP_PID:-0}" "${MAINLOG_POS:-0}"
+  fi
+  sleep "${CLAUDE_RESTART_FIRE_DELAY:-2}"
+  # Preferred: restart INSIDE the same tmux pane with respawn-pane. The iTerm window stays attached to
+  # the same tmux session and just shows the new Claude. No stale window left behind.
+  PANE=""
+  if [[ -n "$SESSION" ]] && tmx has-session -t "$SESSION" 2>/dev/null; then
+    PANE="$(tmx list-panes -s -t "$SESSION" -F '#{pane_id}' 2>/dev/null | head -1)"
+  fi
+  if [[ -n "$PANE" ]]; then
+    SH="${SHELL:-/bin/sh}"
+    LAUNCHER="${CLAUDE_AUTO_RETRY_LAUNCHER:-}"
+    if [[ -z "$LAUNCHER" ]]; then
+      for c in /opt/homebrew/lib/node_modules/claude-auto-retry/src/launcher.js /usr/local/lib/node_modules/claude-auto-retry/src/launcher.js; do
+        [[ -f "$c" ]] && LAUNCHER="$c" && break
+      done
+    fi
+    # A clean exit closes the tmux session; a shell stays only if Claude exits with an error (so the
+    # screen can be read). Always leaving a shell piled up empty sessions.
+    if [[ -n "$LAUNCHER" && -f "$LAUNCHER" ]]; then
+      CMD="CLAUDE_AUTO_RETRY_ACTIVE=1 node '$LAUNCHER' '--resume' '$RESUME_ID'${EXTRA_ARGS:+ $EXTRA_ARGS}; rc=\$?; [ \"\$rc\" -ne 0 ] && exec '$SH'; exit \"\$rc\""
+    else
+      CMD="claude --resume '$RESUME_ID'${EXTRA_ARGS:+ $EXTRA_ARGS}; rc=\$?; [ \"\$rc\" -ne 0 ] && exec '$SH'; exit \"\$rc\""
+    fi
+    if [[ "${CLAUDE_RESTART_DRYRUN:-}" == "1" ]]; then
+      log "DRYRUN respawn $PANE ($SESSION): $CMD"; exit 0
+    fi
+    if tmx respawn-pane -k -t "$PANE" -c "$TARGET" "$CMD" 2>/dev/null; then
+      log "fire: restarted in the SAME pane $PANE ($SESSION); resume $RESUME_ID"
+      exit 0
+    fi
+    log "fire: respawn-pane failed in $PANE; falling back to a new window"
+  fi
+  # Fallback: the tmux session is gone -> kill what is left and open a new window.
+  if [[ -n "$SESSION" ]]; then tmx kill-session -t "$SESSION" 2>/dev/null || true; fi
+  log "fire: killed ${SESSION:-?}; reopening $RESUME_ID in $TARGET (new window)"
+  [[ "${CLAUDE_RESTART_DRYRUN:-}" == "1" ]] || sleep 1
+  open_resume "$TARGET" "$RESUME_ID"
+  exit 0
+fi
+
+# ===== internal: watch (asks if the turn takes too long) =====
+if [[ "${1:-}" == "--watch" ]]; then
+  id="$2"; limit="$3"; M="$PEND/$id.marker"; waited=0; told=0
+  while [[ -f "$M" ]]; do
+    sleep "$POLL"; waited=$((waited + POLL))
+    [[ -f "$M" ]] || break
+    (( waited >= limit )) || continue
+    SESSION=""; TARGET=""; RESUME_ID=""
+    # shellcheck disable=SC1090
+    source "$M"
+    mins=$(( waited / 60 ))
+    if ! is_macos || ! command -v osascript >/dev/null; then
+      # No dialog available: keep waiting for the turn; the user can run --now or --cancel.
+      (( told )) || log "watch: $id has not ended a turn in $mins min; no dialog on this system, still waiting (use --now or --cancel)"
+      told=1; continue
+    fi
+    ans="$(osascript -e "display dialog \"The Claude session in:\" & return & \"$TARGET\" & return & return & \"has not finished a turn in $mins min. It may be idle or on a long task.\" & return & return & \"Kill and reopen now?\" buttons {\"Cancel restart\", \"Wait longer\", \"Kill now\"} default button \"Wait longer\" with title \"claude-restart\" giving up after ${CLAUDE_RESTART_GIVEUP:-600}" 2>/dev/null || echo 'button returned:Wait longer')"
+    case "$ans" in
+      *"Kill now"*)
+        F="$PEND/$id.firing"; mv "$M" "$F" 2>/dev/null || exit 0
+        log "watch: user chose to kill $id after $mins min"
+        exec "$SELF_BIN" --fire "$F" ;;
+      *"Cancel"*)
+        rm -f "$M"; log "watch: user cancelled $id"; exit 0 ;;
+      *)
+        log "watch: wait longer ($id) - answer: $ans"; waited=0 ;;
+    esac
+  done
+  exit 0
+fi
+
+# ===== list / pending =====
+case "${1:-}" in
+  --list|-l)
+    printf '%-42s  %s\n' "TMUX SESSION" "FOLDER"
+    tmx list-sessions -F '#{session_name}|#{pane_current_path}' 2>/dev/null | grep "^$PREFIX" \
+      | while IFS='|' read -r name dir; do printf '%-42s  %s\n' "$name" "$dir"; done || true
+    exit 0 ;;
+  --pending)
+    found=0
+    for M in "$PEND"/*.marker; do
+      [[ -f "$M" ]] || continue; found=1
+      SESSION=""; TARGET=""; RESUME_ID=""; CREATED=""
+      # shellcheck disable=SC1090
+      source "$M"
+      echo "$CREATED  $SESSION  $RESUME_ID  $TARGET"
+    done
+    (( found )) || echo "no restart scheduled"
+    exit 0 ;;
+  -h|--help)
+    sed -n '2,/^set -euo/p' "$SELF_BIN" | sed '$d' | sed 's/^# \{0,1\}//'
+    exit 0 ;;
+esac
+
+# ===== arguments =====
+CONFIRM=no; NOW=no; CANCEL=no; WAITMIN=10; TARGET=""
+while (( $# )); do
+  case "$1" in
+    --yes|-y) CONFIRM=yes ;;
+    --now)    NOW=yes ;;
+    --cancel) CANCEL=yes ;;
+    --wait)   shift; WAITMIN="${1:-}"; [[ "$WAITMIN" =~ ^[0-9]+$ ]] || die "--wait needs minutes (a number)" ;;
+    -*)       die "unknown option: $1" ;;
+    *)        TARGET="$1" ;;
+  esac
+  shift
+done
+TARGET="${TARGET:-$PWD}"
+[[ -d "$TARGET" ]] || die "folder does not exist: $TARGET"
+TARGET="$(cd "$TARGET" && pwd -P)"
+
+if [[ "$CANCEL" == yes ]]; then
+  n=0; want="TARGET=$(printf '%q' "$TARGET")"
+  for M in "$PEND"/*.marker; do
+    [[ -f "$M" ]] || continue
+    if grep -qxF "$want" "$M"; then rm -f "$M"; n=$((n + 1)); fi
+  done
+  log "cancel: $n marker(s) removed for $TARGET"
+  echo "cancelled: $n scheduled restart(s) for $TARGET"
+  exit 0
+fi
+
+# ===== desktop app: run FROM INSIDE a desktop app session =====
+# Applies when the caller is an app session (CLAUDE_CODE_ENTRYPOINT=claude-desktop) and its transcript
+# (CLAUDE_CODE_SESSION_ID) belongs to this folder. Otherwise the tmux mode below runs.
+# NEVER use TMUX_PANE here: in the app it can be stale, from another session.
+APP_SID="${CLAUDE_CODE_SESSION_ID:-}"; APP_HOST="${CLAUDE_CODE_HOST_SESSION_ID:-}"
+SLUG="$(printf '%s' "$TARGET" | sed 's#[^A-Za-z0-9]#-#g')"
+DIR="$PROJ_ROOT/$SLUG"
+if [[ "${CLAUDE_CODE_ENTRYPOINT:-}" == claude-desktop && "$APP_HOST" =~ ^local_[0-9a-f-]{36}$ \
+      && -n "$APP_SID" && -f "$DIR/$APP_SID.jsonl" ]]; then
+  echo "FOLDER   : $TARGET"
+  echo "SESSION  : desktop app $APP_HOST"
+  echo "RESUME ID: $APP_SID   (last write: $(date -r "$DIR/$APP_SID.jsonl" '+%Y-%m-%d %H:%M'))"
+  hook_registered || echo "WARNING: the Stop hook is NOT registered - a scheduled restart never fires." >&2
+  echo
+  if [[ "$CONFIRM" != yes ]]; then
+    echo "PLAN (nothing done - run again with --yes):"
+    echo "  1. wait for this session's turn to end (Stop hook)"
+    echo "  2. stop only this session's claude process (the app stays open)"
+    echo "  3. without touching the UI: the NEXT message starts a new process with --resume $APP_SID"
+    echo "  (--now skips the wait and kills right away)"
+    exit 0
+  fi
+  M="$PEND/$APP_SID.marker"
+  if [[ -f "$M" && "$NOW" != yes ]]; then
+    echo "Already scheduled for this session. See: claude-restart --pending"; exit 0
+  fi
+  {
+    printf 'MODE=app\n'
+    printf 'SESSION=%q\n'   "$APP_HOST"
+    printf 'HOST_SID=%q\n'  "$APP_HOST"
+    printf 'TARGET=%q\n'    "$TARGET"
+    printf 'RESUME_ID=%q\n' "$APP_SID"
+    printf 'CREATED=%q\n'   "$(date '+%F %T')"
+  } > "$M"
+  if [[ "$NOW" == yes ]]; then
+    F="$PEND/$APP_SID.firing"; mv "$M" "$F"
+    log "now: app $APP_SID ($APP_HOST)"
+    nohup "$SELF_BIN" --fire "$F" >/dev/null 2>&1 & disown
+    echo "-> killing and reopening now (in ~3s)."; exit 0
+  fi
+  nohup "$SELF_BIN" --watch "$APP_SID" $(( WAITMIN * 60 )) >/dev/null 2>&1 & disown
+  log "scheduled: app $APP_SID ($APP_HOST), asks after ${WAITMIN} min"
+  echo "SCHEDULED. At the end of the turn this session's process stops. The next message starts the new one (~15 s)."
+  echo "If the turn does not end in $WAITMIN min, a dialog asks whether to kill."
+  echo "Cancel: claude-restart --cancel '$TARGET'"
+  exit 0
+fi
+
+# ===== find this folder's tmux session =====
+# There may be several in the same folder (Claude exited and only the shell is left).
+# Prefer the one with a LIVE Claude process under its pane.
+claude_pids() {  # claude binaries, plus the claude-auto-retry launcher ([t] keeps awk from matching itself)
+  ps -axo pid=,args= 2>/dev/null | awk '{ n=$2; sub(".*/", "", n); if (n == "claude" || $0 ~ /claude-auto-re[t]ry/) print $1 }'
+}
+has_claude() {
+  local pp=$1 c a
+  for c in $(claude_pids); do
+    a=$c
+    while [[ -n "$a" && "$a" != "1" && "$a" != "0" ]]; do
+      [[ "$a" == "$pp" ]] && return 0
+      a=$(ps -o ppid= -p "$a" 2>/dev/null | tr -d ' ')
+    done
+  done
+  return 1
+}
+
+SESSION=""; FIRST=""; MATCHES=0; LIVE=0
+while IFS='|' read -r name dir; do
+  [[ -z "$name" ]] && continue
+  rp="$(cd "$dir" 2>/dev/null && pwd -P || echo "$dir")"
+  [[ "$rp" == "$TARGET" ]] || continue
+  MATCHES=$((MATCHES + 1))
+  [[ -z "$FIRST" ]] && FIRST="$name"
+  pp="$(tmx list-panes -s -t "$name" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  if [[ -n "$pp" ]] && has_claude "$pp"; then
+    LIVE=$((LIVE + 1))
+    [[ -z "$SESSION" ]] && SESSION="$name"
+  fi
+done < <(tmx list-sessions -F '#{session_name}|#{pane_current_path}' 2>/dev/null | grep "^$PREFIX" || true)
+
+if [[ -z "$SESSION" && -n "$FIRST" ]]; then
+  SESSION="$FIRST"
+  echo "WARNING: no session in this folder has a live Claude; using $FIRST (shell only)." >&2
+fi
+if (( LIVE > 1 )); then
+  echo "WARNING: $LIVE sessions with a live Claude in this folder. The resume id may belong to another one." >&2
+elif (( MATCHES > 1 )); then
+  echo "WARNING: $MATCHES tmux sessions in this folder; picked the one with a live Claude: $SESSION" >&2
+fi
+
+# ===== session id =====
+[[ -d "$DIR" ]] || die "no history for this folder: $DIR"
+# Prefer the sessionId of the LIVE Claude inside the session's pane (claude agents --json). "Newest
+# .jsonl" picks the wrong one when two sessions share a folder.
+RESUME_ID=""
+if [[ -n "$SESSION" ]] && command -v claude >/dev/null 2>&1; then
+  PP="$(tmx list-panes -s -t "$SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  [[ -n "$PP" ]] && RESUME_ID="$(claude agents --json 2>/dev/null | python3 -c '
+import json, sys, subprocess
+pp = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit()
+d = d if isinstance(d, list) else d.get("agents", [])
+for a in d:
+    p = str(a.get("pid") or "")
+    seen = set()
+    while p and p not in ("0", "1") and p not in seen:
+        seen.add(p)
+        if p == pp:
+            print(a.get("sessionId", ""))
+            sys.exit()
+        p = subprocess.run(["ps", "-o", "ppid=", "-p", p], capture_output=True, text=True).stdout.strip()
+' "$PP" 2>/dev/null || true)"
+fi
+if [[ -z "$RESUME_ID" ]]; then
+  newest="$(ls -t "$DIR"/*.jsonl 2>/dev/null | head -1 || true)"
+  [[ -n "$newest" ]] && RESUME_ID="$(basename "$newest" .jsonl)"
+  echo "WARNING: could not find the live Claude in the pane; using the folder's newest transcript." >&2
+fi
+[[ -n "$RESUME_ID" && -f "$DIR/$RESUME_ID.jsonl" ]] || die "no .jsonl transcript in $DIR"
+AGE="$(date -r "$DIR/$RESUME_ID.jsonl" '+%Y-%m-%d %H:%M')"
+
+echo "FOLDER   : $TARGET"
+echo "SESSION  : ${SESSION:-(no tmux session open in this folder)}"
+echo "RESUME ID: $RESUME_ID   (last write: $AGE)"
+hook_registered || echo "WARNING: the Stop hook is NOT registered - a scheduled restart never fires." >&2
+echo
+
+if [[ "$CONFIRM" != yes ]]; then
+  echo "PLAN (nothing done - run again with --yes):"
+  echo "  1. wait for this session's turn to end (Stop hook)"
+  echo "  2. then close ${SESSION:-the session} and reopen with: claude --resume $RESUME_ID"
+  echo "  3. if the turn does not end in $WAITMIN min, a dialog asks whether to kill"
+  echo "  (--now skips the wait and kills right away)"
+  exit 0
+fi
+
+M="$PEND/$RESUME_ID.marker"
+if [[ -f "$M" && "$NOW" != yes ]]; then
+  echo "Already scheduled for this session. See: claude-restart --pending"
+  exit 0
+fi
+{
+  printf 'SESSION=%q\n'   "$SESSION"
+  printf 'TARGET=%q\n'    "$TARGET"
+  printf 'RESUME_ID=%q\n' "$RESUME_ID"
+  printf 'CREATED=%q\n'   "$(date '+%F %T')"
+} > "$M"
+
+if [[ "$NOW" == yes ]]; then
+  F="$PEND/$RESUME_ID.firing"; mv "$M" "$F"
+  log "now: $RESUME_ID ($SESSION)"
+  nohup "$SELF_BIN" --fire "$F" >/dev/null 2>&1 & disown
+  echo "-> killing and reopening now (in ~2s)."
+  exit 0
+fi
+
+nohup "$SELF_BIN" --watch "$RESUME_ID" $(( WAITMIN * 60 )) >/dev/null 2>&1 & disown
+log "scheduled: $RESUME_ID ($SESSION), asks after ${WAITMIN} min"
+echo "SCHEDULED. The session restarts when its turn ends."
+echo "If the turn does not end in $WAITMIN min, a dialog asks whether to kill."
+echo "Cancel: claude-restart --cancel '$TARGET'"

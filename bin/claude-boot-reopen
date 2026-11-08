@@ -1,0 +1,56 @@
+#!/bin/bash
+# claude-boot-reopen - runs at login (launchd, RunAtLoad; install.sh sets it up on macOS).
+# Opens iTerm2 with one window that runs `claude-save --reopen`, which reopens the windows and Claude
+# Code sessions of the last save. Without iTerm2 it runs `claude-save --reopen` directly (sessions
+# come back as detached tmux sessions).
+# Test without opening anything: claude-boot-reopen --dry-run
+set -u
+CONF="${SESSION_KEEPER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/session-keeper/config}"
+if [[ -f "$CONF" ]]; then  # KEY=VALUE lines; a variable already set in the environment wins
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"; line="${line#export }"
+    [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
+    [[ -n "${!k:-}" ]] && continue
+    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"; v="${v/#\~/$HOME}"
+    printf -v "$k" '%s' "$v"; export "${k?}"
+  done < "$CONF"
+fi
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PATH="$BIN_DIR:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+if [[ "$(uname -s)" == Darwin ]]; then LOGDIR="${SESSION_KEEPER_LOG_DIR:-$HOME/Library/Logs}"
+else LOGDIR="${SESSION_KEEPER_LOG_DIR:-${SESSION_KEEPER_STATE_DIR:-$HOME/.local/state/session-keeper}/logs}"; fi
+ST="${SESSION_KEEPER_STATE_DIR:-$HOME/.local/state/session-keeper}"
+LOG="$LOGDIR/claude-boot-reopen.log"
+ITERM_APP="${SESSION_KEEPER_ITERM_APP:-/Applications/iTerm.app}"
+SH="${SHELL:-/bin/zsh}"
+mkdir -p "$ST" "$LOGDIR"
+DRY=0; [[ "${1:-}" == "--dry-run" ]] && DRY=1
+ARG="--reopen"; (( DRY )) && ARG="--reopen --dry-run"
+echo "$(date '+%F %T') start ($ARG)" >>"$LOG"
+
+if [[ "$(uname -s)" != Darwin || ! -d "$ITERM_APP" ]]; then
+  echo "$(date '+%F %T') no iTerm2: running claude-save $ARG directly" >>"$LOG"
+  # shellcheck disable=SC2086
+  "$BIN_DIR/claude-save" $ARG >>"$LOG" 2>&1
+  exit 0
+fi
+
+(( DRY )) || sleep "${CLAUDE_BOOT_REOPEN_DELAY:-20}"   # let Finder and the Dock come up
+CMD="$ST/reopen.command"
+cat >"$CMD" <<EOF
+#!$SH -l
+echo "claude-boot-reopen: claude-save $ARG"
+"$BIN_DIR/claude-save" $ARG 2>&1 | tee -a "$LOG"
+echo "\$(date '+%F %T') reopen finished" >>"$LOG"
+exec $SH -l
+EOF
+chmod +x "$CMD"
+# `open -a iTerm x.command` does not run the script; osascript from launchd does.
+for t in 1 2 3 4 5 6; do
+  if osascript -e "tell application \"iTerm\" to create window with default profile command \"$SH -l $CMD\"" >>"$LOG" 2>&1; then
+    echo "$(date '+%F %T') iTerm opened with $CMD (attempt $t)" >>"$LOG"; break
+  fi
+  echo "$(date '+%F %T') osascript failed (attempt $t), retrying in 10 s" >>"$LOG"
+  (( DRY )) || sleep 10
+done

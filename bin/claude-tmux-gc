@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""claude-tmux-gc - close empty "shell" tmux sessions left behind by Claude Code.
+
+An empty shell = a tmux session whose name starts with the prefix (default "claude-") that has NO live
+claude / claude-auto-retry process in any pane and NO client attached (attached=0). Idle time is
+deliberately NOT used: a session waiting for a usage limit to reset is idle on purpose, but its
+claude process is alive. Sessions younger than 10 minutes are kept (claude may still be starting).
+
+Usage: claude-tmux-gc [--dry-run]
+Settings: SESSION_KEEPER_GC_PREFIX (default "claude-"). Log: claude-tmux-gc.log in $SESSION_KEEPER_LOG_DIR.
+install.sh can schedule it daily with launchd (macOS).
+"""
+import collections, os, sys, time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
+from sk_common import cfg, find_tmux, make_logger, run  # noqa: E402
+
+MIN_AGE = 10 * 60
+log = make_logger("claude-tmux-gc.log")
+
+
+def main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__)
+        return 0
+    dry = "--dry-run" in argv
+    prefix = cfg("SESSION_KEEPER_GC_PREFIX", "claude-")
+    tmux = find_tmux()
+    if not tmux:
+        print("claude-tmux-gc: tmux not found; nothing to do.")
+        return 0
+    r = run([tmux, "list-panes", "-a", "-F",
+             "#{session_name}|#{session_created}|#{session_attached}|#{pane_pid}|#{pane_current_path}"])
+    if r.returncode != 0:
+        return 0  # no tmux server = nothing to do
+    kids, args = collections.defaultdict(list), {}
+    for l in run(["ps", "-axo", "pid=,ppid=,args="]).stdout.splitlines():
+        p = l.split(None, 2)
+        if len(p) < 3 or not (p[0].isdigit() and p[1].isdigit()):
+            continue
+        kids[int(p[1])].append(int(p[0]))
+        args[int(p[0])] = p[2]
+
+    def alive(pid):
+        stack = list(kids[pid])
+        while stack:
+            x = stack.pop()
+            if "claude" in args.get(x, ""):  # the claude binary or the claude-auto-retry launcher
+                return True
+            stack += kids[x]
+        return False
+
+    sessions = collections.defaultdict(list)
+    for l in r.stdout.splitlines():
+        if l.count("|") < 4:
+            continue
+        s, c, att, pid, path = l.split("|", 4)
+        sessions[s].append((int(c), att, int(pid), path))
+
+    now, killed, kept = time.time(), 0, 0
+    for s, panes in sorted(sessions.items()):
+        if not s.startswith(prefix):
+            continue
+        created, att = panes[0][0], panes[0][1]
+        if att != "0" or now - created < MIN_AGE or any(alive(p[2]) for p in panes):
+            kept += 1
+            continue
+        if dry:
+            log(f"DRY empty {s} ({panes[0][3]})")
+        else:
+            rc = run([tmux, "kill-session", "-t", s]).returncode
+            log(f"closed empty {s} ({panes[0][3]}) rc={rc}")
+        killed += 1
+    log(f"{'DRY ' if dry else ''}summary: empty={killed} kept={kept}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""claude-folder-title - put the project folder at the start of a Claude Code session title.
+
+Why: when many sessions are open (and especially in the phone app through Remote Control, which shows
+only the session title), "which project is this?" should be readable from the title.
+
+SessionStart hook (startup|resume|fork): reads the hook JSON on stdin (cwd, session_title) and, if the
+title does not start with the folder, answers hookSpecificOutput.sessionTitle (same effect as /rename).
+  "billing export"  in ~/Projects/acme/api   -> "acme/api · billing export"
+  "api-3f" (automatic name)                  -> "acme/api"
+A short folder name you typed yourself ("api", "acme/api") is left alone.
+
+Off by default. Turn it on with SESSION_KEEPER_FOLDER_TITLE=1 (env or config file) or the plugin
+option folder_title=on.
+Folder label: the path relative to one of SESSION_KEEPER_TITLE_ROOTS (colon-separated, e.g.
+"~/Projects:~/work"); else "~/<path>" under your home; else the full path.
+Note: a name passed with --name / --remote-control <name> wins over a hook rename.
+Self-test: claude-folder-title --self-test
+"""
+import json, os, re, sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
+from sk_common import HOME, cfg  # noqa: E402
+
+SEP = " · "
+
+
+def slash(p):
+    """Forward slashes everywhere, so labels look the same on Windows."""
+    return p.replace("\\", "/") if os.sep == "\\" else p
+
+
+def roots():
+    out = []
+    sep = ";" if os.name == "nt" else ":"
+    for r in cfg("SESSION_KEEPER_TITLE_ROOTS").split(sep):
+        r = os.path.expanduser(r.strip()).rstrip("/\\")
+        if r:
+            out += [slash(r), slash(os.path.realpath(r))]
+    return list(dict.fromkeys(out))
+
+
+def label(cwd):
+    cwd = slash(os.path.realpath(cwd or HOME)).rstrip("/")
+    for root in roots():
+        if cwd == root:
+            return os.path.basename(root) or root
+        if cwd.startswith(root + "/"):
+            return cwd[len(root) + 1:]
+    if cwd.startswith(("/private/tmp/", "/tmp/")):
+        return os.path.basename(cwd)
+    for h in (slash(HOME), slash(os.path.realpath(HOME))):
+        if cwd == h:
+            return "~"
+        if cwd.startswith(h + "/"):
+            return "~/" + cwd[len(h) + 1:]
+    return cwd
+
+
+def new_title(cwd, title):
+    r = label(cwd)
+    t = (title or "").strip()
+    if t == r or t.startswith(r + " ") and not t.startswith(r + SEP):
+        return None  # already starts with the folder
+    if folder_tail(t, r):
+        return None  # a short folder name typed by hand: leave it
+    # drop stacked folder prefixes ("A · A/b · A · ..." from an older bug or manual edits)
+    parts = t.split(SEP)
+    while parts and related(parts[0].rstrip("…").strip(), r):
+        parts.pop(0)
+    t = SEP.join(parts).strip()
+    if folder_tail(t, r):
+        return t  # "acme/api · api" (prefix stacked on the short name) -> "api"
+    base = os.path.basename(os.path.realpath(cwd or HOME)).lower()
+    if not t or re.fullmatch(re.escape(base) + r"-[0-9a-z]{2}", t.lower()):
+        new = r  # an automatic name (e.g. api-3f) only repeated the folder
+    else:
+        new = r + SEP + t
+    return None if new == (title or "").strip() else new
+
+
+def folder_tail(t, r):
+    """t is the end of the folder label: "api" or "acme/api" for "acme/api"; ignores case and -/space."""
+    norm = lambda s: s.lower().replace("-", " ").strip()
+    segs = r.split("/")
+    return bool(t) and any(norm(t) == norm("/".join(segs[i:])) for i in range(len(segs)))
+
+
+def related(a, r):
+    """a is the same folder as r, an ancestor or a descendant (or a piece of one cut with …)."""
+    if not a:
+        return False
+    return a == r or r.startswith(a + "/") or a.startswith(r + "/") or (len(a) >= 4 and r.startswith(a))
+
+
+def enabled():
+    v = (cfg("SESSION_KEEPER_FOLDER_TITLE") or os.environ.get("CLAUDE_PLUGIN_OPTION_FOLDER_TITLE") or "").lower()
+    return v in ("1", "on", "true", "yes")
+
+
+def self_test():
+    global roots
+    P = slash(os.path.realpath(os.path.join(HOME, "Projects")))
+    saved = roots
+    roots = lambda: [P]  # noqa: E731
+    cases = [
+        (f"{P}/acme/billing", "billing export material", "acme/billing · billing export material"),
+        (P, "projects-ca", "Projects"),
+        (f"{P}/home/rpg", "rpg-ca", "home/rpg"),
+        (f"{P}/acme", "acme · calsync", None),
+        (f"{P}/acme", "acme", None),
+        (f"{P}/acme", "", "acme"),
+        (f"{P}/acme", None, "acme"),
+        (f"{HOME}/Documents", "notes", "~/Documents · notes"),
+        (P, "Projects Terminal", None),
+        (f"{P}/acme", "acme-3e", "acme"),
+        (f"{P}/home/career", "home/career · home/career/market · home/career · Accelerator", "home/career · Accelerator"),
+        (f"{P}/home/career/market", "home/career · Accelerator", "home/career/market · Accelerator"),
+        (f"{P}/home/career", "home/career · home/career/market · home/career · home/ca…", "home/career"),
+        (f"{P}/acme/api", "api", None),
+        (f"{P}/home/career", "career", None),
+        (f"{P}/acme/gold-star", "Gold Star", None),
+        (f"{P}/acme/api", "acme/api · api", "api"),
+        (f"{P}/home/career", "home/career · career", "career"),
+        (f"{P}/home/trips", "trips booking 2027", "home/trips · trips booking 2027"),
+    ]
+    ok = 0
+    for cwd, t, expected in cases:
+        r = new_title(cwd, t)
+        ok += r == expected
+        print(("ok " if r == expected else "FAIL ") + f"{t!r} -> {r!r} (expected {expected!r})")
+    roots = saved
+    print(f"{ok}/{len(cases)}")
+    return 0 if ok == len(cases) else 1
+
+
+def main():
+    a = sys.argv[1:]
+    if a == ["--self-test"]:
+        return self_test()
+    if a[:1] in (["-h"], ["--help"]):
+        print(__doc__)
+        return 0
+    try:
+        e = json.load(sys.stdin)
+        if not enabled():
+            return 0
+        ev = e.get("hook_event_name")
+        if ev == "SessionStart" and e.get("source") not in ("startup", "resume", "fork"):
+            return 0  # sessionTitle only applies to these three
+        t = new_title(e.get("cwd"), e.get("session_title"))
+        if t:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": ev, "sessionTitle": t}}, ensure_ascii=False))
+    except Exception:
+        pass  # hook: never get in the way of a session
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

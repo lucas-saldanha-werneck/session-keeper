@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+"""claude-iterm-restart - quit and reopen iTerm2 with its windows and Claude Code sessions as they were.
+
+Usage:
+  claude-iterm-restart              take a snapshot, quit iTerm, reopen it and restore everything
+  claude-iterm-restart --update     same, and install the newest iTerm2 release while it is closed
+  claude-iterm-restart --dry-run    only show the snapshot and what would happen
+  claude-iterm-restart --snapshot   only take the snapshot (add --quiet for a tmux hook; at most 1/min)
+  claude-iterm-restart --reopen     restore from the last snapshot (e.g. after a crash)
+
+How it works:
+  1. Snapshot: position of each window and what runs in each tab: a tmux session, Claude outside
+     tmux (conversation id from ~/.claude/sessions/<pid>.json) or a plain shell (its folder).
+  2. A background process (tmux run-shell -b when tmux runs, so it outlives iTerm; else a detached
+     fork) does the rest: waits for each Claude outside tmux to go idle (up to 10 min) and stops it
+     (the conversation is saved); detaches the tmux clients (Claude keeps running inside); quits iTerm
+     without the quit prompts; [--update] downloads the newest zip from the official appcast, checks
+     its signature (iTerm2's Apple team id) and swaps the app; reopens iTerm and recreates every
+     window at the same place: tmux attach / claude --resume / cd.
+Requires macOS and iTerm2. tmux is optional. Snapshot: $SESSION_KEEPER_STATE_DIR/snapshot.json
+Log: claude-iterm-restart.log in $SESSION_KEEPER_LOG_DIR (default ~/Library/Logs).
+"""
+import collections, json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
+from sk_common import HOME, cfg, claude_dir, find_tmux, is_macos, make_logger, run, short_path, state_dir  # noqa: E402
+
+STATE_DIR = state_dir()
+SNAPSHOT = os.path.join(STATE_DIR, "snapshot.json")
+TMUX = find_tmux() or "tmux"
+HAS_TMUX = find_tmux() is not None
+APP = cfg("SESSION_KEEPER_ITERM_APP", "/Applications/iTerm.app")
+DOMAIN = "com.googlecode.iterm2"
+TEAM = "H7V7XYVQ7D"  # iTerm2's Apple Developer team id (public; used to verify downloaded updates)
+APPCAST = "https://iterm2.com/appcasts/final_modern.xml"
+THROTTLE = 60
+QUIET = "--quiet" in sys.argv
+SHELLS = ("zsh", "bash", "sh", "fish", "login")
+log = make_logger("claude-iterm-restart.log", QUIET)
+
+
+def osa(script, timeout=20):
+    return run(["osascript", "-e", script], timeout=timeout)
+
+
+def iterm_installed():
+    return is_macos() and os.path.isdir(APP)
+
+
+def iterm_running():
+    # -a: macOS pgrep skips its own ancestors; run from inside iTerm it would not find iTerm without it
+    return run(["pgrep", "-a", "-x", "iTerm2"]).returncode == 0
+
+
+# ---------- snapshot ----------
+
+LIST_OSA = '''set out to ""
+tell application "iTerm"
+  repeat with w in windows
+    if visible of w then
+      set b to bounds of w
+      set ti to 0
+      repeat with t in tabs of w
+        set ti to ti + 1
+        set s to current session of t
+        set out to out & (id of w) & "|" & (item 1 of b) & "," & (item 2 of b) & "," & (item 3 of b) & "," & (item 4 of b) & "|" & ti & "|" & (tty of s) & linefeed
+      end repeat
+    end if
+  end repeat
+end tell
+return out'''
+
+
+def proc_table():
+    kids, info = collections.defaultdict(list), {}
+    for l in run(["ps", "-axo", "pid=,ppid=,tty=,args="]).stdout.splitlines():
+        p = l.split(None, 3)
+        if len(p) == 4 and p[0].isdigit() and p[1].isdigit():
+            pid, ppid = int(p[0]), int(p[1])
+            kids[ppid].append(pid)
+            info[pid] = (p[2], p[3])
+    return kids, info
+
+
+def is_claude(args):
+    first = args.split()[0] if args else ""
+    return os.path.basename(first) == "claude"
+
+
+def prog_name(args):
+    return os.path.basename(args.split()[0].lstrip("-")) if args and args.strip() else ""
+
+
+def claude_session(pid, args):
+    """Current conversation of a claude process (session file, else the --resume argument)."""
+    try:
+        with open(os.path.join(claude_dir(), "sessions", f"{pid}.json")) as f:
+            d = json.load(f)
+        return d.get("sessionId"), d.get("cwd"), d.get("status"), d.get("name")
+    except Exception:
+        m = re.search(r"--resume\s+([0-9a-f-]{36})", args)
+        return (m.group(1) if m else None), None, None, None
+
+
+def cwd_of(pid):
+    r = run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"])
+    for l in r.stdout.splitlines():
+        if l.startswith("n"):
+            return l[1:]
+    return HOME
+
+
+def take_snapshot():
+    if not iterm_installed() or not iterm_running():
+        return None
+    r = osa(LIST_OSA)
+    for _ in range(2):  # a window closing mid-list gives "Invalid index" (-1719): try again
+        if r.returncode == 0 or "-1719" not in r.stderr:
+            break
+        time.sleep(1)
+        r = osa(LIST_OSA)
+    if r.returncode != 0:
+        log(f"snapshot: osascript failed: {r.stderr.strip()[:200]}")
+        return None
+    kids, info = proc_table()
+    clients = {}
+    for l in run([TMUX, "list-clients", "-F", "#{client_tty}|#{session_name}"]).stdout.splitlines():
+        if "|" in l:
+            tty, s = l.split("|", 1)
+            clients[tty] = s
+    panes = collections.defaultdict(list)
+    for l in run([TMUX, "list-panes", "-a", "-F", "#{session_name}|#{pane_pid}|#{pane_current_path}"]).stdout.splitlines():
+        if l.count("|") >= 2:
+            s, pid, path = l.split("|", 2)
+            panes[s].append((int(pid), path))
+
+    def claude_in_tree(pid):
+        stack = [pid]
+        while stack:
+            x = stack.pop()
+            if x in info and is_claude(info[x][1]):
+                return x
+            stack += kids[x]
+        return None
+
+    windows = []
+    for l in r.stdout.splitlines():
+        if l.count("|") < 3:
+            continue
+        wid, b, ti, tty = l.split("|", 3)
+        item = {"window": int(wid), "bounds": [int(float(x)) for x in b.split(",")], "tab": int(ti), "tty": tty}
+        short = tty.replace("/dev/", "")
+        on_tty = [(pid, a) for pid, (t, a) in info.items() if t == short]
+        if tty in clients:
+            s = clients[tty]
+            item.update(kind="tmux", session=s, cwd=panes[s][0][1] if panes[s] else HOME)
+            cp = next((c for c in (claude_in_tree(p) for p, _ in panes[s]) if c), None)
+            if cp:
+                sid, ccwd, st, name = claude_session(cp, info[cp][1])
+                item.update(claude_id=sid, claude_cwd=ccwd or item["cwd"], name=name,
+                            remote="--remote-control" in info[cp][1])
+        else:
+            cl = [(p, a) for p, a in on_tty if is_claude(a)]
+            if cl:
+                pid, a = cl[0]
+                sid, ccwd, st, name = claude_session(pid, a)
+                item.update(kind="claude", pid=pid, claude_id=sid, cwd=ccwd or cwd_of(pid), status=st,
+                            name=name, remote="--remote-control" in a)
+            else:
+                shells = [p for p, a in on_tty if prog_name(a) in SHELLS[:4]]
+                item.update(kind="shell", cwd=cwd_of(shells[0]) if shells else HOME)
+        windows.append(item)
+    snap = {"taken_at": time.time(), "when": time.strftime("%Y-%m-%d %H:%M:%S"), "windows": windows}
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = SNAPSHOT + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(snap, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, SNAPSHOT)
+    return snap
+
+
+def describe(j):
+    folder = short_path(j.get("claude_cwd") or j.get("cwd"))
+    if j["kind"] == "tmux":
+        return f"tmux {j['session']} ({j.get('name') or 'no Claude'}) [{folder}]"
+    if j["kind"] == "claude":
+        return f"Claude outside tmux {(j.get('claude_id') or '?')[:8]} ({j.get('name')}) [{folder}] status={j.get('status')}"
+    return f"shell [{folder}]"
+
+
+def resume_cmd(cwd, sid, remote=False):
+    extra = cfg("SESSION_KEEPER_CLAUDE_ARGS")
+    args = ["claude", "--resume", sid]
+    if remote and "--remote-control" not in extra:
+        args.append("--remote-control")
+    return f"cd {shlex.quote(cwd)} && " + " ".join(args) + (f" {extra}" if extra else "")
+
+
+# ---------- phase 2 (runs in the background) ----------
+
+def pref_get(key):
+    r = run(["defaults", "read", DOMAIN, key])
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def pref_restore(key, old):
+    if old is None:
+        run(["defaults", "delete", DOMAIN, key])
+    else:
+        run(["defaults", "write", DOMAIN, key, "-bool", "true" if old == "1" else "false"])
+
+
+def stop_claudes(snap):
+    for j in snap["windows"]:
+        if j["kind"] != "claude":
+            continue
+        pid = j["pid"]
+        for _ in range(120):  # up to 10 min waiting for it to go idle
+            try:
+                with open(os.path.join(claude_dir(), "sessions", f"{pid}.json")) as f:
+                    st = json.load(f).get("status")
+            except Exception:
+                st = "idle"
+            if st != "busy":
+                break
+            time.sleep(5)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        for _ in range(30):
+            if run(["ps", "-p", str(pid)]).returncode != 0:
+                break
+            time.sleep(0.5)
+        else:
+            os.kill(pid, signal.SIGKILL)
+        log(f"stopped Claude outside tmux pid {pid} ({(j.get('claude_id') or '?')[:8]}); it will be resumed")
+
+
+def update_app():
+    current = run(["defaults", "read", f"{APP}/Contents/Info.plist", "CFBundleShortVersionString"]).stdout.strip()
+    tmp = tempfile.mkdtemp(prefix="iterm-upd-")
+    xml = f"{tmp}/appcast.xml"
+    run(["curl", "-sL", APPCAST, "-o", xml])
+    versions = []
+    try:
+        text = open(xml).read()
+    except OSError:
+        text = ""
+    for item in re.findall(r"<item>.*?</item>", text, re.S):
+        u = re.search(r'url="([^"]+\.zip)"', item)
+        v = re.search(r'sparkle:version="([^"]+)"', item) or re.search(r"<sparkle:version>([^<]+)<", item)
+        if u and v:
+            versions.append((tuple(int(x) for x in re.findall(r"\d+", v.group(1))), v.group(1), u.group(1)))
+    if not versions:
+        log("update: could not read the appcast; continuing without updating")
+        return
+    versions.sort()
+    tup, new, url = versions[-1]
+    if tup <= tuple(int(x) for x in re.findall(r"\d+", current)):
+        log(f"update: already on the latest ({current})")
+        return
+    z = f"{tmp}/iTerm.zip"
+    if run(["curl", "-sfL", url, "-o", z]).returncode != 0:
+        log("update: download failed; continuing without updating")
+        return
+    run(["ditto", "-x", "-k", z, f"{tmp}/x"])
+    newapp = f"{tmp}/x/iTerm.app"
+    ok = run(["codesign", "--verify", "--deep", "--strict", newapp]).returncode == 0
+    team = f"TeamIdentifier={TEAM}" in run(["codesign", "-dv", newapp]).stderr
+    if not (ok and team):
+        log(f"update: signature does NOT match (valid={ok}, team={team}); kept {current}")
+        return
+    bak = f"{tmp}/iTerm-{current}.app"
+    shutil.move(APP, bak)
+    try:
+        shutil.move(newapp, APP)
+    except Exception as e:
+        shutil.move(bak, APP)
+        log(f"update: swap failed ({e}); restored {current}")
+        return
+    log(f"update: iTerm {current} -> {new} (old version kept in {bak})")
+
+
+def wait_for(cond, seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def close_empty(ours, reason):
+    # Right after boot iTerm can take >20 s to answer; closing empty windows is a nicety, so a timeout
+    # here must not abort the restore.
+    try:
+        _close_empty(ours, reason)
+    except subprocess.TimeoutExpired:
+        log(f"did not close empty windows {reason}: iTerm did not answer osascript within 20 s")
+
+
+def _close_empty(ours, reason):
+    # A window we did not create, running only login + an idle shell, is closed.
+    ids = [x.strip() for x in osa('tell application "iTerm" to get id of (windows whose visible is true)').stdout.split(",") if x.strip()]
+    for wid in ids:
+        if wid in ours:
+            continue
+        tty = osa(f'tell application "iTerm" to tell current session of (first window whose id is {wid}) to get tty').stdout.strip()
+        procs = run(["ps", "-t", tty.replace("/dev/", ""), "-o", "args="]).stdout.splitlines() if tty else []
+        if procs and all(p.startswith("/usr/bin/login") or prog_name(p) in SHELLS[:4] for p in procs):
+            osa(f'tell application "iTerm" to close (first window whose id is {wid})')
+            log(f"closed the empty window {reason} {wid}")
+
+
+def clean_env():
+    """Environment for a freshly launched iTerm. The background phase may run inside tmux or a Claude
+    session; without this every new shell would inherit TMUX (and skip tmux wrappers) or NO_COLOR."""
+    drop = ("CLAUDE_AUTO_RETRY_ACTIVE", "CLAUDECODE", "NO_COLOR", "FORCE_COLOR")
+    return {k: v for k, v in os.environ.items() if not k.startswith("TMUX") and k not in drop}
+
+
+def reopen(snap, protect=frozenset()):
+    # protect: ids of windows that already existed and must not be closed as "empty"
+    if not iterm_running():
+        run(["open", "-a", APP], env=clean_env())
+    if not wait_for(lambda: osa('tell application "iTerm" to count windows', 5).returncode == 0, 60):
+        log("reopen: iTerm did not answer within 60 s")
+        return
+    # The window iTerm opens by itself at launch can arrive late, in the middle of ours. Wait for it
+    # and close it BEFORE creating ours.
+    wait_for(lambda: osa('tell application "iTerm" to count windows', 5).stdout.strip() not in ("", "0"), 6)
+    time.sleep(1)
+    close_empty(set(protect), "at launch")
+    alive = set(run([TMUX, "list-sessions", "-F", "#{session_name}"]).stdout.split())
+    # AppleScript lists windows front to back: create back to front, so the front window ends up in
+    # front again. Tabs keep their order inside a window.
+    order = list(dict.fromkeys(j["window"] for j in snap["windows"]))
+    made = {}
+    for wsnap in reversed(order):
+        for j in [x for x in snap["windows"] if x["window"] == wsnap]:
+            if j["kind"] == "tmux" and j["session"] in alive:
+                cmd = f"cd {shlex.quote(j['cwd'])} && {shlex.quote(TMUX)} attach-session -t {shlex.quote(j['session'])}"
+            elif j.get("cmd"):  # ready-made command from claude-save
+                cmd = j["cmd"]
+            elif j.get("claude_id"):
+                cmd = resume_cmd(j.get("claude_cwd") or j["cwd"], j["claude_id"], j.get("remote"))
+            else:
+                cmd = f"cd {shlex.quote(j.get('cwd') or HOME)}"
+            cmd = cmd.replace("\\", "\\\\").replace('"', '\\"')
+            b = j["bounds"]
+            bs = f"{{{b[0]}, {b[1]}, {b[2]}, {b[3]}}}"
+            # Keep the new session in a variable: the command goes to IT, not to the "current session"
+            # of a window that may have changed meanwhile.
+            if wsnap in made:
+                s = (f'tell application "iTerm"\nset w to (first window whose id is {made[wsnap]})\n'
+                     f'tell w to set t to (create tab with default profile)\nset s to current session of t\n'
+                     f'tell s to write text "{cmd}"\nreturn (id of w as text) & "|" & (tty of s)\nend tell')
+            else:
+                s = (f'tell application "iTerm"\nset w to (create window with default profile)\n'
+                     f'set s to current session of w\nset bounds of w to {bs}\n'
+                     f'tell s to write text "{cmd}"\nreturn (id of w as text) & "|" & (tty of s)\nend tell')
+            r = osa(s)
+            wid, _, tty = r.stdout.strip().partition("|")
+            if r.returncode == 0 and wsnap not in made:
+                made[wsnap] = wid
+                time.sleep(0.5)
+                got = osa(f'tell application "iTerm" to get bounds of (first window whose id is {wid})').stdout.strip()
+                try:
+                    same = [int(float(x)) for x in got.split(",") if x.strip()] == list(b)
+                except ValueError:
+                    same = False
+                if not same:
+                    osa(f'tell application "iTerm" to set bounds of (first window whose id is {wid}) to {bs}')
+                    log(f"  bounds of {wid} came back as {got}; set {b} again")
+            log(f"reopened {describe(j)} -> window {wid} {tty}: {'ok' if r.returncode == 0 else 'FAILED ' + r.stderr.strip()[:150]}")
+            time.sleep(0.4)
+        # The 2nd tab makes the tab bar appear and the window grows; set the bounds again.
+        if wsnap in made and sum(1 for x in snap["windows"] if x["window"] == wsnap) > 1:
+            b = next(x["bounds"] for x in snap["windows"] if x["window"] == wsnap)
+            osa(f'tell application "iTerm" to set bounds of (first window whose id is {made[wsnap]}) to {{{b[0]}, {b[1]}, {b[2]}, {b[3]}}}')
+    # Another late launch window may still arrive.
+    time.sleep(3)
+    close_empty(set(made.values()) | set(protect), "at launch (late)")
+    try:
+        if order and order[0] in made:
+            osa(f'tell application "iTerm" to select (first window whose id is {made[order[0]]})')
+    except subprocess.TimeoutExpired:
+        log("did not bring the first window to the front: iTerm did not answer within 20 s")
+
+
+def phase2():
+    with open(SNAPSHOT) as f:
+        snap = json.load(f)
+    updating = "--update" in sys.argv
+    # Two iTerm prompts on quit: PromptOnQuit ("Quit iTerm2?") and OnlyWhenMoreTabs (closing several
+    # sessions). Turned off for the quit, restored afterwards.
+    old_prompt = pref_get("PromptOnQuit")
+    old_multi = pref_get("OnlyWhenMoreTabs")
+    log(f"phase2: starting ({len(snap['windows'])} windows in the snapshot of {snap['when']}){' + update' if updating else ''}")
+    try:
+        stop_claudes(snap)
+        for j in snap["windows"]:
+            if j["kind"] == "tmux":
+                run([TMUX, "detach-client", "-t", j["tty"]])
+        time.sleep(1)
+        run(["defaults", "write", DOMAIN, "PromptOnQuit", "-bool", "false"])
+        run(["defaults", "write", DOMAIN, "OnlyWhenMoreTabs", "-bool", "false"])
+        # Close the windows before quitting: with 0 windows iTerm has nothing to ask about.
+        osa('tell application "iTerm"\nrepeat with w in (windows whose visible is true)\nclose w\nend repeat\nend tell', 30)
+        time.sleep(1)
+        osa('tell application "iTerm" to quit', 30)
+        if not wait_for(lambda: not iterm_running(), 60):
+            log("phase2: iTerm did not quit within 60 s (dialog open?). Stopped; nothing lost: run claude-iterm-restart --reopen")
+            return 1
+        log("iTerm closed")
+        if updating:
+            update_app()
+    finally:
+        pref_restore("PromptOnQuit", old_prompt)
+        pref_restore("OnlyWhenMoreTabs", old_multi)
+    reopen(snap)
+    alive = dict(l.split("|", 1) for l in
+                 run([TMUX, "list-sessions", "-F", "#{session_name}|#{session_attached}"]).stdout.split() if "|" in l)
+    stuck = [j["session"] for j in snap["windows"] if j["kind"] == "tmux" and alive.get(j["session"]) == "0"]
+    log(f"done: {len(snap['windows'])} window(s) in the snapshot; tmux sessions still without a window: {stuck or 'none'}")
+    return 0
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] and a[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    known = {"--phase2", "--snapshot", "--quiet", "--reopen", "--dry-run", "--update"}
+    if [x for x in a if x not in known]:
+        print(f"unknown option: {[x for x in a if x not in known]} - nothing done. See --help.")
+        return 2
+    if not iterm_installed():
+        if not ("--snapshot" in a and QUIET):
+            print(f"claude-iterm-restart needs macOS and iTerm2 ({APP} not found). Nothing done.")
+        return 0 if QUIET else 2
+    if "--phase2" in a:
+        return phase2()
+    if "--snapshot" in a:
+        if QUIET:
+            try:
+                with open(SNAPSHOT) as f:
+                    if time.time() - json.load(f)["taken_at"] < THROTTLE:
+                        return 0
+            except Exception:
+                pass
+            # Called from a tmux hook: an error must not show in the window; it goes to the log.
+            try:
+                take_snapshot()
+            except Exception:
+                import traceback
+                log("snapshot (hook) failed: " + traceback.format_exc().strip().replace("\n", " | ")[-600:])
+            return 0
+        f = take_snapshot()
+        if f:
+            for j in f["windows"]:
+                print(describe(j))
+        return 0
+    if "--reopen" in a:
+        try:
+            with open(SNAPSHOT) as f:
+                snap = json.load(f)
+        except OSError:
+            print(f"no snapshot at {SNAPSHOT}. Take one with: claude-iterm-restart --snapshot")
+            return 1
+        reopen(snap)
+        return 0
+    snap = take_snapshot()
+    if not snap:
+        print("iTerm is not running (or did not answer). To restore the last snapshot: claude-iterm-restart --reopen")
+        return 1
+    # The shell window this command was run from does not come back.
+    try:
+        my_tty = os.ttyname(sys.stdin.fileno())
+    except OSError:
+        my_tty = None
+    launcher = [j for j in snap["windows"] if j["tty"] == my_tty and j["kind"] == "shell"]
+    if launcher and sum(1 for j in snap["windows"] if j["window"] == launcher[0]["window"]) == 1:
+        snap["windows"] = [j for j in snap["windows"] if j is not launcher[0]]
+        with open(SNAPSHOT, "w") as f:
+            json.dump(snap, f, indent=1, ensure_ascii=False)
+    print(f"snapshot of {len(snap['windows'])} window(s):")
+    for j in snap["windows"]:
+        print("  " + describe(j))
+    if "--dry-run" in a:
+        return 0
+    extra = ["--update"] if "--update" in a else []
+    me = os.path.realpath(__file__)
+    py = sys.executable or "python3"
+    if HAS_TMUX and run([TMUX, "has-session"]).returncode == 0:
+        # runs inside the tmux server: does not die when iTerm quits
+        line = " ".join(shlex.quote(x) for x in [py, me, "--phase2"] + extra)
+        run([TMUX, "run-shell", "-b", f"{line} >/dev/null 2>&1"])
+    else:
+        if os.fork() == 0:
+            os.setsid()
+            if os.fork() == 0:
+                os.execv(py, [py, me, "--phase2"] + extra)
+            os._exit(0)
+    print("quitting and reopening iTerm in the background... log: claude-iterm-restart.log")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

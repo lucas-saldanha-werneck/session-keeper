@@ -1,0 +1,34 @@
+{
+  "name": "session-keeper",
+  "version": "0.1.0",
+  "description": "Restart your Mac, iTerm2 or a single Claude Code session without losing windows or conversations: snapshot windows, tabs, tmux sessions and Claude session ids, then reopen and resume them.",
+  "author": {
+    "name": "Lucas Saldanha Werneck",
+    "url": "https://github.com/lucas-saldanha-werneck"
+  },
+  "homepage": "https://github.com/lucas-saldanha-werneck/session-keeper",
+  "repository": "https://github.com/lucas-saldanha-werneck/session-keeper",
+  "license": "MIT",
+  "keywords": [
+    "restart",
+    "resume",
+    "session",
+    "iterm2",
+    "tmux",
+    "macos",
+    "launchd",
+    "hooks"
+  ],
+  "userConfig": {
+    "folder_title": {
+      "type": "string",
+      "title": "Put the folder at the start of session titles",
+      "description": "on: a SessionStart hook renames sessions to '<folder> · <title>', handy when many sessions are open or on a phone through Remote Control.",
+      "options": [
+        "off",
+        "on"
+      ],
+      "default": "off"
+    }
+  }
+}

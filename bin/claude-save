@@ -1,0 +1,603 @@
+#!/usr/bin/env python3
+"""claude-save - save your iTerm2 windows and Claude Code sessions, restart the Mac, get them back.
+
+Usage:
+  claude-save                        BEFORE restarting: save everything to $SESSION_KEEPER_STATE_DIR/save.json
+  claude-save --dry-run              only show what would be saved
+  claude-save --auto                 for launchd (every 5 min): saves only when something changed; does NOT
+                                     overwrite a pre-boot save that has not been reopened yet
+  claude-save --warn                 SessionStart hook: warns when --auto is paused waiting for --reopen
+  claude-save --reopen               AFTER restarting (in an iTerm window): reopen everything
+  claude-save --reopen --dry-run     show the plan without opening anything
+  claude-save --reopen --force       reopen a save that was already restored
+  claude-save --reopen --keep-window do not close the window --reopen was run from
+  claude-save --reopen --no-window   sessions that had no window come back as detached tmux sessions
+                                     (default: each gets its own window)
+  claude-save --reopen --file X      use another save file
+
+What it saves:
+  - every visible iTerm window: position, tabs and what runs in each (Claude -> conversation id;
+    tmux without Claude -> folder and command; shell -> folder). Needs iTerm2; without it, skipped.
+  - tmux sessions WITHOUT a window: Claude -> conversation id; another program -> folder and command.
+    Needs tmux; without it, skipped.
+What it reopens:
+  - windows at the same place and order; Claude with `claude --resume <id>` (plus --remote-control
+    if the session had it, plus $SESSION_KEEPER_CLAUDE_ARGS);
+  - window-less tmux sessions with the same name, Claude resumed inside;
+  - a program that is not Claude (e.g. node) comes back only TYPED at the prompt, without Enter (zsh);
+  - skips conversations that are already open.
+Why a separate file from claude-iterm-restart's snapshot: that snapshot is retaken by the tmux hook;
+after a reboot it would be replaced by a snapshot of the empty Mac.
+Log: claude-save.log in $SESSION_KEEPER_LOG_DIR (default ~/Library/Logs).
+"""
+import glob, importlib.util, json, os, re, shlex, subprocess, sys, time
+from importlib.machinery import SourceFileLoader
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(BIN), "lib"))
+from sk_common import HOME, cfg, claude_dir, make_logger, notify, short_path, state_dir  # noqa: E402
+
+_ld = SourceFileLoader("claude_iterm_restart", os.path.join(BIN, "claude-iterm-restart"))
+_sp = importlib.util.spec_from_loader("claude_iterm_restart", _ld)
+cir = importlib.util.module_from_spec(_sp)
+_ld.exec_module(cir)
+
+STATE = state_dir()
+SAVE = os.path.join(STATE, "save.json")
+SHELLS = cir.SHELLS
+PRESENCE_VAR = "CLAUDE_CODE_DISABLE_NOTIFICATION_PRESENCE_CHECK"
+log = make_logger("claude-save.log")
+cir.log = log  # cir.reopen() writes to our log
+
+
+def run(*a, **k):
+    return cir.run(*a, **k)
+
+
+def osa(*a, **k):
+    return cir.osa(*a, **k)
+
+
+def tmux():
+    return cir.TMUX
+
+
+def keep_env_vars():
+    return cfg("SESSION_KEEPER_KEEP_ENV", f"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS {PRESENCE_VAR}").split()
+
+
+def ignored_sessions():
+    return set(cfg("SESSION_KEEPER_IGNORE_SESSIONS").split())
+
+
+def user_shell():
+    return cfg("SESSION_KEEPER_SHELL", os.environ.get("SHELL") or "/bin/zsh")
+
+
+def alive_claude(pid):
+    r = run(["ps", "-p", str(pid), "-o", "args="])
+    return r.returncode == 0 and cir.is_claude(r.stdout.strip())
+
+
+def live_sessions():
+    """sessionId -> data from ~/.claude/sessions/<pid>.json, only for claude processes still alive."""
+    out = {}
+    for f in glob.glob(os.path.join(claude_dir(), "sessions", "*.json")):
+        try:
+            with open(f) as fh:
+                d = json.load(fh)
+        except Exception:
+            continue
+        if d.get("kind") == "interactive" and d.get("sessionId") and d.get("pid") and alive_claude(d["pid"]):
+            out[d["sessionId"]] = d
+    return out
+
+
+def proc_env(pid):
+    """VAR -> value for the variables listed in SESSION_KEEPER_KEEP_ENV, read from the process (macOS ps -E)."""
+    out = {}
+    text = run(["ps", "-E", "-ww", "-p", str(pid), "-o", "command="]).stdout
+    for var in keep_env_vars():
+        m = re.search(r"(?:^|\s)" + re.escape(var) + r"=(\S*)", text)
+        if m:
+            out[var] = m.group(1)
+    return out
+
+
+def proc_args(pid):
+    return run(["ps", "-ww", "-p", str(pid), "-o", "args="]).stdout.strip()
+
+
+def my_ancestors():
+    kids, _ = cir.proc_table()
+    parent = {c: p for p, cs in kids.items() for c in cs}
+    out, x = set(), os.getpid()
+    while x in parent and x not in out:
+        out.add(x)
+        x = parent[x]
+    return out
+
+
+def claude_cmd(cwd, sid, d, remote=None):
+    """Command that resumes conversation sid in cwd, carrying the env vars and --remote-control the
+    original process had."""
+    env = []
+    if d and d.get("pid"):
+        env = [f"{k}={shlex.quote(v)}" for k, v in proc_env(d["pid"]).items()]
+        if remote is None:
+            remote = "--remote-control" in proc_args(d["pid"])
+    args = ["claude", "--resume", sid]
+    extra = cfg("SESSION_KEEPER_CLAUDE_ARGS")
+    if remote and "--remote-control" not in extra:
+        args.append("--remote-control")
+    return f"cd {shlex.quote(cwd)} && " + " ".join(env + args) + (f" {extra}" if extra else "")
+
+
+def typed_cmd(cwd, command):
+    """cd to the folder and leave `command` typed at the prompt (zsh `print -z`). Other shells cannot
+    pre-fill the prompt, so the command is only echoed as a reminder."""
+    base = f"cd {shlex.quote(cwd or HOME)}"
+    if not command:
+        return base
+    if os.path.basename(user_shell()) == "zsh":
+        return base + f" && print -z -- {shlex.quote(command)}"
+    return base + f" && echo {shlex.quote('was running: ' + command)}"
+
+
+def pane_command(pane_pid):
+    """Command line of the program running in the pane (not a shell, not Claude), or None."""
+    kids, info = cir.proc_table()
+    queue = [pane_pid]
+    while queue:
+        x = queue.pop(0)
+        if x in info:
+            args = info[x][1]
+            if cir.prog_name(args) not in SHELLS and not cir.is_claude(args):
+                return args
+        queue += kids[x]
+    return None
+
+
+def panes_of(session):
+    out = []
+    for l in run([tmux(), "list-panes", "-t", session, "-F", "#{pane_pid}|#{pane_current_path}"]).stdout.splitlines():
+        if "|" in l:
+            pid, path = l.split("|", 1)
+            out.append((int(pid), path))
+    return out
+
+
+def claude_of_tmux_session(session, live):
+    return next((d for d in live.values() if (d.get("tmux") or "").split(":")[0] == session), None)
+
+
+def describe(x):
+    folder = short_path(x.get("cwd"))
+    if x.get("claude_id"):
+        return f"Claude {x['claude_id'][:8]} ({x.get('name') or 'no name'}) [{folder}]"
+    if x.get("command"):
+        return f"program `{x['command'][:60]}` [{folder}]"
+    return f"shell [{folder}]"
+
+
+def my_tty():
+    try:
+        return os.ttyname(sys.stdin.fileno())
+    except OSError:
+        return None
+
+
+# ---------- save ----------
+
+def tmux_started_at():
+    """When the tmux server started. A reboot = a new tmux server. kern.boottime is NOT used: macOS
+    moves it forward when the Mac sleeps, which blocked --auto for a whole day without a reboot."""
+    r = run([tmux(), "display-message", "-p", "#{start_time}"])
+    try:
+        return int(r.stdout.strip())
+    except Exception:
+        return 0
+
+
+def signature(save):
+    """What matters for reopening; if it did not change, --auto does not write again."""
+    return json.dumps([[(j.get("claude_id"), j.get("cwd"), j.get("command"), j.get("bounds"), j.get("tab"))
+                        for j in save.get("windows", [])],
+                       [(s.get("session"), s.get("claude_id"), s.get("command")) for s in save.get("detached", [])]])
+
+
+def paused():
+    """(save, boot) when --auto is paused waiting for --reopen; else None.
+    After a reboot the Mac starts empty: saving now would overwrite the good pre-boot save."""
+    try:
+        with open(SAVE) as f:
+            old = json.load(f)
+    except Exception:
+        return None
+    boot = tmux_started_at()
+    # 24 h without reopening = the save was abandoned; saving resumes (old copies stay in save-*.json)
+    if old["saved_at"] < boot and not old.get("restored_at") and time.time() - boot <= 24 * 3600:
+        return old, boot
+    return None
+
+
+def warn_sessionstart():
+    """SessionStart hook: tells the user (and the model) that auto-save is paused. No output = all good."""
+    p = paused()
+    if not p:
+        return 0
+    old, boot = p
+    try:
+        sid = json.load(sys.stdin).get("session_id")
+    except Exception:
+        sid = None
+    ids = {x.get("claude_id") for x in old.get("windows", []) + old.get("detached", [])}
+    if sid and sid in ids:
+        return 0  # a conversation being reopened by --reopen itself
+    n = sum(1 for i in ids if i)
+    msg = (f"Auto-save PAUSED: the Mac/tmux restarted ({time.strftime('%Y-%m-%d %H:%M', time.localtime(boot))}) and "
+           f"the save from {old.get('when')} ({n} conversation(s)) has not been reopened yet. New conversations "
+           f"are not being saved. Run: claude-save --reopen  (preview: claude-save --reopen --dry-run)")
+    print(json.dumps({"systemMessage": msg, "hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": msg + " - Tell the user at the start of your reply and offer to run --reopen "
+                                   "(with --keep-window, so this session's window is not closed)."}}))
+    return 0
+
+
+def auto_may_save():
+    p = paused()
+    if p:
+        old, boot = p
+        mark = os.path.join(STATE, "auto-blocked")  # log once per blocked save, not every 5 min
+        try:
+            seen = open(mark).read()
+        except OSError:
+            seen = ""
+        if seen != str(old["saved_at"]):
+            log(f"auto: paused until --reopen - the save from {old.get('when')} is older than the tmux server "
+                f"({time.strftime('%Y-%m-%d %H:%M', time.localtime(boot))})")
+            os.makedirs(STATE, exist_ok=True)
+            with open(mark, "w") as f:
+                f.write(str(old["saved_at"]))
+        return False
+    return True
+
+
+def save(dry, auto=False):
+    if auto and not auto_may_save():
+        return 0
+    live = live_sessions()
+    me = my_ancestors()
+    snap = cir.take_snapshot()
+    # iTerm installed but closed, or osascript failed: a partial snapshot would erase the windows from
+    # the save. Without iTerm at all there are no windows to lose, so saving the tmux sessions is fine.
+    if auto and snap is None and cir.iterm_installed():
+        return 0
+    snap = snap or {"windows": []}
+    windows = []
+    for j in snap["windows"]:
+        sid = j.get("claude_id")
+        if sid:
+            d = live.get(sid)
+            j["cwd"] = j.get("claude_cwd") or j.get("cwd") or HOME
+            j["cmd"] = claude_cmd(j["cwd"], sid, d, remote=j.get("remote"))
+            j["status"] = (d or {}).get("status")
+            j["pid"] = (d or {}).get("pid")
+        else:
+            panes = panes_of(j["session"]) if j["kind"] == "tmux" else []
+            com = next((c for c in (pane_command(p) for p, _ in panes) if c), None)
+            j["command"] = com
+            j["cmd"] = typed_cmd(j.get("cwd"), com)
+        windows.append(j)
+    # the shell window claude-save was run from does not need to come back
+    tty = my_tty()
+    launcher = [j for j in windows if j["tty"] == tty and j["kind"] == "shell"]
+    if launcher and sum(1 for j in windows if j["window"] == launcher[0]["window"]) == 1:
+        windows.remove(launcher[0])
+
+    with_window = {j["session"] for j in windows if j.get("kind") == "tmux"}
+    detached = []
+    for name in run([tmux(), "list-sessions", "-F", "#{session_name}"]).stdout.split():
+        if name in with_window or name in ignored_sessions():
+            continue
+        d = claude_of_tmux_session(name, live)
+        if d:
+            cwd = d.get("cwd") or HOME
+            detached.append({"session": name, "cwd": cwd, "claude_id": d["sessionId"], "name": d.get("name"),
+                             "status": d.get("status"), "pid": d["pid"],
+                             "cmd": claude_cmd(cwd, d["sessionId"], d)})
+            continue
+        panes = panes_of(name)
+        com = next((c for c in (pane_command(p) for p, _ in panes) if c), None)
+        if com:  # a tmux session with only an idle shell does not come back
+            detached.append({"session": name, "cwd": panes[0][1] if panes else HOME, "command": com})
+
+    busy = [x for x in windows + detached if x.get("status") == "busy" and x.get("pid") not in me]
+    data = {"saved_at": time.time(), "when": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "windows": windows, "detached": detached, "restored_at": None}
+    history = True
+    if auto:
+        if not any(x.get("claude_id") for x in windows + detached):
+            return 0  # no Claude open: nothing worth saving
+        try:
+            with open(SAVE) as f:
+                old = json.load(f)
+        except Exception:
+            old = {}
+        if signature(old) == signature(data):
+            if not old.get("restored_at"):
+                return 0  # nothing changed
+            history = False  # only drops the "restored" mark, so the next --reopen does not need --force
+        return write(data, history, f"auto: {len(windows)} window(s), {len(detached)} detached")
+    print(f"{len(windows)} iTerm window(s)/tab(s):" + ("" if cir.iterm_installed() else " (iTerm2 not found: skipped)"))
+    for j in windows:
+        print(f"  {describe(j)}  pos {j['bounds']}" + (f" (tab {j['tab']})" if j["tab"] > 1 else ""))
+    print(f"{len(detached)} tmux session(s) without a window:" + ("" if cir.HAS_TMUX else " (tmux not found: skipped)"))
+    for s in detached:
+        print(f"  {s['session']}: {describe(s)}")
+    if dry:
+        print("(dry-run: nothing saved)")
+        return 0
+    write(data, True, f"saved: {len(windows)} window(s), {len(detached)} detached -> {SAVE}")
+    if busy:
+        print("\nWARNING - these sessions are working right now. Wait for them to finish before restarting "
+              "(otherwise the reply in progress is lost) and run claude-save again:")
+        for x in busy:
+            print(f"  {describe(x)}")
+    else:
+        print("\nReady to restart. Afterwards, in an iTerm window: claude-save --reopen")
+    return 0
+
+
+def write(data, history, msg):
+    os.makedirs(STATE, exist_ok=True)
+    tmp = SAVE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, SAVE)
+    if history:  # dated copies: only the last 10
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(STATE, f"save-{stamp}.json")
+        n = 1
+        while os.path.exists(path):
+            path = os.path.join(STATE, f"save-{stamp}-{n}.json")
+            n += 1
+        with open(path, "w") as f:
+            json.dump(data, f, indent=1, ensure_ascii=False)
+        for old in sorted(glob.glob(os.path.join(STATE, "save-*.json")))[:-10]:
+            os.remove(old)
+    log(msg)
+    return 0
+
+
+# ---------- reopen ----------
+
+def close_caller_window(tty):
+    """Closes the window --reopen was run from, if it has one tab and only a shell + this script run in it."""
+    if not tty or not cir.iterm_installed():
+        return
+    lines = [l.split("|") for l in osa(cir.LIST_OSA).stdout.splitlines() if l.count("|") >= 3]
+    mine = [l for l in lines if l[3] == tty]
+    if not mine or sum(1 for l in lines if l[0] == mine[0][0]) != 1:
+        return
+    for p in run(["ps", "-t", tty.replace("/dev/", ""), "-o", "args="]).stdout.splitlines():
+        name = cir.prog_name(p)
+        if name and name not in SHELLS + ("ps",) and "claude-save" not in p and not p.startswith("/usr/bin/login"):
+            return  # something else runs there (e.g. a Claude): leave the window
+    log("closing the window --reopen was run from")
+    osa(f'tell application "iTerm" to close (first window whose id is {mine[0][0]})')
+
+
+def n_conversations(data):
+    return sum(1 for x in data.get("windows", []) + data.get("detached", []) if x.get("claude_id"))
+
+
+def pick_save():
+    """Before a restart windows close one by one and --auto saves a shrinking list. So --reopen uses,
+    among the copies from the hour before the newest save, the one with MORE conversations (tie = the
+    newest). Conversations already open are skipped as usual."""
+    try:
+        with open(SAVE) as f:
+            newest = json.load(f)
+    except Exception:
+        return SAVE
+    best, n = SAVE, n_conversations(newest)
+    for f in sorted(glob.glob(os.path.join(STATE, "save-*.json")), reverse=True):
+        try:
+            with open(f) as fh:
+                d = json.load(fh)
+        except Exception:
+            continue
+        if newest["saved_at"] - 3600 <= d["saved_at"] <= newest["saved_at"] and n_conversations(d) > n:
+            best, n = f, n_conversations(d)
+    return best
+
+
+def screen_of(cid):
+    """Text on the screen of the tmux pane running `--resume <cid>`; None if not found."""
+    kids, info = cir.proc_table()
+    for l in run([tmux(), "list-panes", "-a", "-F", "#{pane_id}|#{pane_pid}"]).stdout.splitlines():
+        pane, _, pid = l.partition("|")
+        queue = [int(pid)] if pid.isdigit() else []
+        while queue:
+            x = queue.pop()
+            if cid in info.get(x, ("", ""))[1]:
+                return run([tmux(), "capture-pane", "-p", "-t", pane]).stdout
+            queue += kids[x]
+    return None
+
+
+def why_not_up(cid):
+    """Why the conversation did not come up, read from its screen."""
+    screen = screen_of(cid)
+    if screen is None:
+        return "could not find its window/tmux pane"
+    if "trust this folder" in screen:
+        return "stopped at the 'Yes, I trust this folder' prompt (folder not trusted; answer it in the window)"
+    lines = [l.strip() for l in screen.splitlines() if l.strip()]
+    return "not up yet; last line on screen: " + (lines[-1][:120] if lines else "(empty screen)")
+
+
+def strip_presence(cmd):
+    return re.sub(PRESENCE_VAR + r"=\S*\s+", "", cmd)
+
+
+def start_detached(s):
+    """Start one window-less tmux session. Returns the CompletedProcess."""
+    sh = user_shell()
+    if s.get("claude_id"):
+        inner = f"{sh} -lic {shlex.quote(s['cmd'])}; exec {sh} -l"
+        return run([tmux(), "new-session", "-d", "-s", s["session"], "-c", s["cwd"], inner])
+    r = run([tmux(), "new-session", "-d", "-s", s["session"], "-c", s["cwd"]])
+    if r.returncode == 0 and s.get("command"):
+        time.sleep(float(cfg("CLAUDE_SAVE_TYPE_DELAY", "1")))
+        run([tmux(), "send-keys", "-t", s["session"], s["command"]])  # no Enter: only typed
+    return r
+
+
+def reopen(path, dry, force, newest=None):
+    with open(path) as f:
+        data = json.load(f)
+    print(f"save from {data['when']} ({(time.time() - data['saved_at']) / 3600:.1f} h ago)")
+    if newest:  # path is a history copy picked instead of save.json
+        print(f"  (the newest save, from {newest['when']}, has only {n_conversations(newest)} conversation(s); "
+              f"using the copy from {data['when']}, which had {n_conversations(data)})")
+        data["restored_at"] = newest.get("restored_at")
+    if data.get("restored_at") and not force and not dry:
+        print(f"this save was already restored at {data['restored_at']}. To reopen it again: claude-save --reopen --force")
+        return 1
+    live = live_sessions()
+    alive = set(run([tmux(), "list-sessions", "-F", "#{session_name}"]).stdout.split())
+    have_iterm = cir.iterm_installed()
+    windows, detached, manual = [], [], []
+    for j in data["windows"]:
+        if j.get("claude_id") in live:
+            print(f"  skip (already open): {describe(j)}")
+        elif have_iterm:
+            windows.append(j)
+        elif j.get("kind") == "tmux" and j.get("session") in alive:
+            print(f"  skip (tmux session still running): {describe(j)}")
+        else:  # no iTerm on this machine: the window comes back as a detached tmux session
+            name = j.get("session") or (f"claude-{j['claude_id'][:8]}" if j.get("claude_id") else f"shell-{len(detached)}")
+            detached.append({**j, "session": name, "cwd": j.get("cwd") or HOME})
+    no_window = "--no-window" in sys.argv or not have_iterm
+    for i, s in enumerate(data["detached"]):
+        if s.get("claude_id") in live or s["session"] in alive:
+            print(f"  skip (already exists): {s['session']}: {describe(s)}")
+        elif no_window:
+            detached.append(s)
+        else:
+            # By default a window-less session comes back in its own window, cascaded (after a reboot
+            # you are at the Mac). --no-window = it comes back as a detached tmux session, as it was.
+            cmd = strip_presence(s["cmd"]) if s.get("claude_id") else typed_cmd(s["cwd"], s.get("command"))
+            dx = 40 * (i + 1)
+            windows.append({**s, "window": f"detached-{i}", "tab": 1, "tty": "", "kind": "detached",
+                            "bounds": [60 + dx, 30 + dx, 900 + dx, 830 + dx], "cmd": cmd})
+    if detached and not cir.HAS_TMUX:
+        manual, detached = detached, []
+    print(f"will open {len(windows)} window(s)/tab(s) and {len(detached)} tmux session(s) without a window:")
+    for j in windows:
+        action = "reattach tmux" if j.get("kind") == "tmux" and j.get("session") in alive else "open"
+        print(f"  window ({action}): {describe(j)}  pos {j['bounds']}")
+    for s in detached:
+        print(f"  tmux {s['session']}: {describe(s)}")
+    if manual:
+        print("neither iTerm2 nor tmux found; run these yourself:")
+        for s in manual:
+            print(f"  {s.get('cmd') or typed_cmd(s.get('cwd'), s.get('command'))}")
+    if dry:
+        print("(dry-run: nothing opened)")
+        return 0
+    log(f"reopen: save from {data['when']}: {len(windows)} window(s), {len(detached)} detached")
+
+    for s in detached:
+        r = start_detached(s)
+        log(f"tmux {s['session']} ({describe(s)}): {'ok' if r.returncode == 0 else 'FAILED ' + r.stderr.strip()[:150]}")
+
+    tty = my_tty()
+    error = None
+    if windows:
+        # an osascript timeout here must not abort the whole --reopen (no restored_at, no check)
+        try:
+            # windows that were open before --reopen are not closed as "empty"
+            before = {l.split("|")[0] for l in osa(cir.LIST_OSA).stdout.splitlines() if "|" in l} if cir.iterm_running() else set()
+            cir.reopen({"windows": windows}, protect=before)
+        except Exception as e:
+            error = f"{type(e).__name__}: {str(e)[:200]}"
+            log(f"reopen: error while opening windows ({error}); going on to the check")
+    waiting = [x["claude_id"] for x in windows + detached if x.get("claude_id")]
+    for _ in range(int(cfg("CLAUDE_SAVE_WAIT", "60")) * 2):  # right after boot Claude is slow to come up
+        live = live_sessions()
+        if all(i in live for i in waiting):
+            break
+        time.sleep(0.5)
+    missing = [i for i in waiting if i not in live]
+    marked = not error or len(missing) < len(waiting)  # error and nothing up = leave the save for another --reopen
+    if marked:
+        data["restored_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(path, "w") as f:
+            json.dump(data, f, indent=1, ensure_ascii=False)
+        if newest:  # unblocks --auto, which looks at save.json
+            newest["restored_at"] = data["restored_at"]
+            with open(SAVE, "w") as f:
+                json.dump(newest, f, indent=1, ensure_ascii=False)
+    names = {x["claude_id"]: describe(x) for x in windows + detached if x.get("claude_id")}
+    problems = [f"{names[i]}: {why_not_up(i)}" for i in missing]
+    for p in problems:
+        log(f"reopen: DID NOT COME UP {p}")
+    print(f"done: {len(waiting) - len(missing)} of {len(waiting)} conversation(s) up" +
+          (f"; not up yet: {[i[:8] for i in missing]} (see the log)" if missing else ""))
+    log(f"reopen: end; {len(waiting) - len(missing)}/{len(waiting)} conversations alive; missing {[i[:8] for i in missing]}")
+    if problems or error:
+        notify(f"claude-save --reopen: {len(waiting) - len(missing)} of {len(waiting)} conversation(s) came back."
+               + "".join(f"\n- {p}" for p in problems)
+               + (f"\nError while opening windows: {error}" if error else "")
+               + ("" if marked else "\nNothing was marked as restored: run claude-save --reopen again."), log)
+    if "--keep-window" not in sys.argv:
+        close_caller_window(tty)
+    return 0
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] and a[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    if "--reopen" in a:
+        if "--file" in a:
+            i = a.index("--file")
+            if i + 1 >= len(a):
+                print("--file needs a path")
+                return 2
+            path = a[i + 1]
+        else:
+            path = pick_save()
+        if not os.path.exists(path):
+            print(f"{path} not found. Run claude-save before restarting.")
+            return 1
+        newest = None
+        if "--file" not in a and path != SAVE:
+            with open(SAVE) as f:
+                newest = json.load(f)
+        return reopen(path, "--dry-run" in a, "--force" in a, newest)
+    if a == ["--warn"]:
+        try:
+            return warn_sessionstart()
+        except Exception:
+            return 0  # hook: never get in the way of a session start
+    if a == ["--auto"]:
+        try:
+            return save(False, auto=True)
+        except Exception:  # runs from launchd: errors go to the log, not the screen
+            import traceback
+            log("auto failed: " + traceback.format_exc().strip().replace("\n", " | ")[-600:])
+            return 0
+    if any(x != "--dry-run" for x in a):
+        print(__doc__)
+        return 2
+    return save("--dry-run" in a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

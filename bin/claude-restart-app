@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""claude-restart-app - the "desktop app" half of claude-restart (macOS Claude desktop app).
+
+Usage (claude-restart --fire runs this detached, after the turn):
+  claude-restart-app local_<uuid> <claude-pid|0> [app-log-position]
+
+What it does (without touching the UI):
+  1. Waits for the app to close the turn ("Query completed for session" / "cycle for" in main.log).
+  2. Stops ONLY this session's `claude` process (SIGTERM; SIGKILL if it does not exit in 10 s).
+     The pid is checked against the process's CLAUDE_CODE_HOST_SESSION_ID. TMUX_PANE is never used:
+     in the app it can be stale and point to ANOTHER session.
+  3. Optional: runs $SESSION_KEEPER_APP_NUDGE <session-id> <message>, a command of your own that
+     sends the session a message (so the restart happens without waiting for you).
+  Otherwise, on the NEXT message the app starts a new process with --resume <same id> and the new
+  config loads.
+
+It never types into the input box or changes focus.
+Log: ~/.claude/restart-pending/restart.log ([app] lines).
+"""
+import os, re, shlex, signal, sys, time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
+from sk_common import HOME, cfg, claude_dir, run  # noqa: E402
+
+MAINLOG = cfg("SESSION_KEEPER_APP_LOG", os.path.join(HOME, "Library", "Logs", "Claude", "main.log"))
+LOG = os.path.join(claude_dir(), "restart-pending", "restart.log")
+CLI_MARK = "laude.app/Contents/MacOS/claude"
+DRYRUN = os.environ.get("CLAUDE_RESTART_DRYRUN") == "1"
+WAIT = float(cfg("CLAUDE_RESTART_APP_WAIT", "60"))
+SID = ""
+
+
+def log(msg):
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a") as fh:
+        fh.write(f"{time.strftime('%F %T')} [app {SID}] {msg}\n")
+
+
+def size():
+    try:
+        return os.path.getsize(MAINLOG)
+    except OSError:
+        return 0
+
+
+def since(pos):
+    if size() < pos:  # log rotated
+        pos = 0
+    try:
+        with open(MAINLOG, "rb") as fh:
+            fh.seek(pos)
+            return fh.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def wait(pos, needles, timeout, step=0.5):
+    end = time.time() + timeout
+    while time.time() < end:
+        txt = since(pos)
+        if any(n in txt for n in needles):
+            return True
+        time.sleep(step)
+    return False
+
+
+def env_host(pid):
+    """CLAUDE_CODE_HOST_SESSION_ID of the process (its environment at start)."""
+    out = run(["ps", "-E", "-ww", "-p", str(pid), "-o", "command="]).stdout
+    m = re.search(r"CLAUDE_CODE_HOST_SESSION_ID=(local_[0-9a-f-]{36})", out)
+    return m.group(1) if m else None
+
+
+def cmd_of(pid):
+    return run(["ps", "-ww", "-p", str(pid), "-o", "command="]).stdout.strip()
+
+
+def is_cli(pid):
+    c = cmd_of(pid)
+    return CLI_MARK in c and "Helpers/disclaimer" not in c and "--input-format" in c and env_host(pid) == SID
+
+
+def find_cli(hint):
+    """The app's claude process (not the 'disclaimer' helper) that belongs to SID."""
+    if hint and hint != "0" and is_cli(hint):
+        return hint
+    out = run(["pgrep", "-f", CLI_MARK]).stdout.split()
+    hits = [p for p in out if is_cli(p)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
+def main(hint, start):
+    # 1. turn closed. "Query completed" is written ~1 s BEFORE the position the hook recorded, so look
+    #    4 KB back; "healthy cycle for" comes after.
+    if not wait(max(0, start - 4000), [f"Query completed for session {SID}", f"cycle for {SID}"], WAIT):
+        log(f"the app did not close the turn in {WAIT:.0f} s; going on anyway")
+    time.sleep(0 if DRYRUN else 2)
+    pid = find_cli(hint)
+    if not pid:
+        log(f"could not find this session's claude process (hint {hint}); nothing done")
+        return 1
+    if DRYRUN:
+        log(f"DRYRUN would stop pid {pid}")
+        return 0
+    # 2. stop only that process
+    os.kill(int(pid), signal.SIGTERM)
+    for _ in range(20):
+        if not alive(pid):
+            break
+        time.sleep(0.5)
+    if alive(pid):
+        os.kill(int(pid), signal.SIGKILL)
+        time.sleep(1)
+    log(f"process {pid} stopped (alive={alive(pid)}); the next message starts the new process")
+    # 3. optional nudge: a command of yours that sends the session a message
+    nudge = cfg("SESSION_KEEPER_APP_NUDGE")
+    if nudge:
+        r = run(shlex.split(nudge) + [SID, "claude-restart: session restarted, new config loaded. Continue where "
+                                           "you left off; if nothing was in progress, just say 'restarted'."], timeout=60)
+        log(f"nudge rc={r.returncode} {r.stdout.strip()[:100]} {r.stderr.strip()[:100]}")
+    return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3 or not re.fullmatch(r"local_[0-9a-f-]{36}", sys.argv[1]):
+        sys.exit("usage: claude-restart-app local_<uuid> <pid|0> [app-log-position]")
+    SID = sys.argv[1]
+    pos = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else size()
+    sys.exit(main(sys.argv[2], pos))
