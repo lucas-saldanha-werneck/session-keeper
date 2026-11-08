@@ -93,10 +93,25 @@ warns you about that).
 
 Requires Python 3.8+ and bash.
 
+## Your settings
+
+Your settings are in `~/.config/session-keeper/config` (or `$SESSION_KEEPER_CONFIG`; `$XDG_CONFIG_HOME` is
+respected). You do not have to create it: the first time the plugin starts a session, or `claude-save` really runs (`--help` and `--dry-run` write nothing),
+it is created from [`config.example`](config.example), which lists every option with its default, commented
+out, so it changes nothing until you edit a line. A file that already exists is never changed, and plugin
+updates or a new `install.sh` never touch it.
+
 ## Configuration
 
 Environment variables, or the same `KEY=VALUE` lines in `~/.config/session-keeper/config`
 (launchd jobs do not see your shell profile, so the file is the place for settings they need).
+
+**Your settings survive updates.** The config file lives outside both the plugin folder (which
+Claude Code replaces on every plugin update) and the `install.sh` copy in
+`~/.local/share/session-keeper` (replaced when you re-run it), so updating never touches it. The
+plugin's `userConfig` (`/config` in Claude Code) only reaches the plugin's hooks; the commands run
+from your shell and from launchd, so everything they read is in this file or the environment.
+`SESSION_KEEPER_CONFIG` points to another file.
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -116,6 +131,40 @@ Environment variables, or the same `KEY=VALUE` lines in `~/.config/session-keepe
 | `SESSION_KEEPER_APP_NUDGE` | empty | Desktop app only: a command that gets `<session id> <message>` after `claude-restart` stopped an app session, to send it a message so it restarts right away |
 | `CLAUDE_AUTO_RETRY_LAUNCHER` | Homebrew/npm global path | `claude-restart` restarts through the claude-auto-retry launcher when it is installed |
 | `CLAUDE_SAVE_WAIT` | `60` | Seconds `--reopen` waits for the conversations to come up |
+| `SESSION_KEEPER_PRE_SAVE` | empty | A command run before a manual `claude-save` (not `--auto`, not `--dry-run`). If it fails, a warning with its last output line is shown; the save still happens |
+| `SESSION_KEEPER_PRE_REOPEN` | empty | A command run before `--reopen` opens anything, e.g. a check that your secrets manager is unlocked. If it fails, a warning is shown and the reopen goes on |
+| `SESSION_KEEPER_PRE_REOPEN_FAIL_ENV` | empty | `KEY=VALUE` pairs put in front of every resumed `claude` command when `SESSION_KEEPER_PRE_REOPEN` failed (e.g. a flag that tells your shell wrapper not to wait for secrets) |
+| `SESSION_KEEPER_POST_BOOT` | empty | A command `claude-boot-reopen` runs once the reopen has finished (through `claude-save --post-boot`). It gets `SESSION_KEEPER_REOPEN_RESULT` (`ok`, `failed` or `timeout`), `SESSION_KEEPER_REOPEN_UP` and `SESSION_KEEPER_REOPEN_TOTAL` (conversations back / expected) in its environment, and whatever it prints is sent to `SESSION_KEEPER_NOTIFY`. If iTerm2 cannot be opened at all, nothing is reopened, the command is skipped and the notifier gets a message instead |
+| `SESSION_KEEPER_POST_BOOT_WAIT` | `600` | Longest wait, in seconds, for the reopen to finish before the post-boot command runs anyway (with `timeout`) |
+| `SESSION_KEEPER_POST_BOOT_DELAY` | `0` | Extra seconds after the reopen finished, before the post-boot command |
+| `SESSION_KEEPER_HOOK_TIMEOUT` | `30` | Seconds each of the three commands above may take; a timeout counts as a failure. A value that is not a number is ignored with a warning |
+| `SESSION_KEEPER_DROP_ENV` | empty | Extra environment variables (space-separated) not passed to an iTerm2 that session-keeper launches, so new shells start clean (e.g. a "secrets already loaded" flag) |
+
+How the file is read (the Python and the bash commands share these rules): one pair of quotes around the
+whole value is removed; a leading `~`, `~/`, `$HOME` or `${HOME}` becomes your home folder; nothing else is
+expanded, so `sh -c 'echo $X'` reaches `sh` exactly as written. A variable that is set (non-empty) in the
+environment wins over the file.
+
+The command settings are split like a shell line (quotes work; pipes and `&&` do not, wrap those in
+`sh -c '...'`). When `SESSION_KEEPER_PRE_REOPEN` fails, the reopen goes on and the warning is also sent to
+`SESSION_KEEPER_NOTIFY`, since the window `--reopen` ran in usually closes. launchd jobs run with a short `PATH` (`~/.local/bin`, Homebrew, system folders), so
+use a full path for anything else.
+
+Example `~/.config/session-keeper/config` for someone who keeps secrets in a password manager and
+wants a phone message after a reboot:
+
+```
+SESSION_KEEPER_NOTIFY=~/.local/bin/push-me
+SESSION_KEEPER_CLAUDE_ARGS=--remote-control
+SESSION_KEEPER_TITLE_ROOTS=~/Projects
+# warn before reopening when the vault is locked; sessions then start without waiting for it
+SESSION_KEEPER_PRE_REOPEN=/bin/zsh -lic 'my-secrets --check'
+SESSION_KEEPER_PRE_REOPEN_FAIL_ENV=SECRETS_LOADED=1
+SESSION_KEEPER_DROP_ENV=SECRETS_LOADED
+# 3 minutes after login, a script prints a one-line report that goes to push-me
+SESSION_KEEPER_POST_BOOT=~/.local/bin/after-reboot-report
+SESSION_KEEPER_POST_BOOT_DELAY=180
+```
 
 `CLAUDE_CONFIG_DIR` is respected.
 

@@ -80,6 +80,8 @@ for c in "${CMDS[@]}"; do
   do_ chmod 755 "$SHARE/bin/$c"
 done
 do_ cp "$SRC/lib/sk_common.py" "$SHARE/lib/sk_common.py"
+do_ cp "$SRC/lib/sk_config.sh" "$SHARE/lib/sk_config.sh"
+do_ cp "$SRC/config.example" "$SHARE/config.example"   # starter the commands copy to ~/.config on first run
 for c in "${CMDS[@]}"; do
   t="$BIN_DIR/$c"
   if [[ -e "$t" && ! -L "$t" && "$FORCE" != 1 ]]; then

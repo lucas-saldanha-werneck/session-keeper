@@ -8,6 +8,7 @@ lives in a temporary folder. Runs on macOS, Linux and Windows. Run: python3 test
 import importlib.util
 import io
 import json
+import shlex
 import os
 import shutil
 import subprocess
@@ -122,6 +123,8 @@ class FakeSystem:
             return self._osa(a[1])
         if prog == "notifier":
             return cp(cmd, 0, "sent")
+        if prog == "user-cmd":  # stands for the user's own pre/post commands: `user-cmd <rc> <stdout>`
+            return cp(cmd, int(cmd[1]), " ".join(cmd[2:]), "")
         return cp(cmd, 127, "", f"{prog}: not faked")
 
     def _ps(self, a):
@@ -211,7 +214,9 @@ class Base(unittest.TestCase):
     def tearDown(self):
         for p in reversed(self.patches):
             p.stop()
-        for k in ("SESSION_KEEPER_NOTIFY", "SESSION_KEEPER_IGNORE_SESSIONS", "SESSION_KEEPER_CLAUDE_ARGS"):
+        for k in ("SESSION_KEEPER_NOTIFY", "SESSION_KEEPER_IGNORE_SESSIONS", "SESSION_KEEPER_CLAUDE_ARGS",
+                  "SESSION_KEEPER_PRE_SAVE", "SESSION_KEEPER_PRE_REOPEN", "SESSION_KEEPER_PRE_REOPEN_FAIL_ENV",
+                  "SESSION_KEEPER_POST_BOOT", "SESSION_KEEPER_DROP_ENV"):
             os.environ.pop(k, None)
 
     def out(self, fn, *a, argv=None):
@@ -256,7 +261,7 @@ class TestConfig(unittest.TestCase):
         with open(p, "w") as f:
             f.write("# comment\nexport A_ONE='~/x'\nB_TWO=\"two\"\nNOT A LINE\nSESSION_KEEPER_GC_PREFIX=file\n")
         c = sk_common._read_config(p)
-        self.assertEqual(c["A_ONE"], os.path.join(HOME, "x"))
+        self.assertEqual(c["A_ONE"], HOME + "/x")
         self.assertEqual(c["B_TWO"], "two")
         self.assertNotIn("NOT A LINE", c)
         with mock.patch.dict(sk_common._CONFIG, c), mock.patch.dict(os.environ, {"SESSION_KEEPER_GC_PREFIX": "env"}):
@@ -264,6 +269,27 @@ class TestConfig(unittest.TestCase):
         with mock.patch.dict(sk_common._CONFIG, c):
             self.assertEqual(sk_common.cfg("SESSION_KEEPER_GC_PREFIX"), "file")
             self.assertEqual(sk_common.cfg("MISSING_X", "dflt"), "dflt")
+
+    def test_commands_reach_their_program_as_written(self):
+        # review #3 and #4: no $VAR expansion inside a command, no normpath of non-path settings
+        p = os.path.join(TMP, "cfg-cmd")
+        with open(p, "w") as f:
+            f.write("SESSION_KEEPER_PRE_REOPEN=sh -c 'echo $HOME $USER'\n"
+                    "SESSION_KEEPER_NOTIFY=$HOME/bin/push --url https://example.com//x\n"
+                    "SESSION_KEEPER_STATE_DIR=~/state//sub/\n"
+                    "OTHER=${HOME}\nNOT_HOME=$HOMEX/y\nTILDE_USER=~root/x\n")
+        c = sk_common._read_config(p)
+        self.assertEqual(c["SESSION_KEEPER_PRE_REOPEN"], "sh -c 'echo $HOME $USER'")
+        self.assertEqual(c["SESSION_KEEPER_NOTIFY"], HOME + "/bin/push --url https://example.com//x")
+        self.assertEqual(c["SESSION_KEEPER_STATE_DIR"], os.path.normpath(HOME + "/state//sub/"))
+        self.assertEqual(c["OTHER"], HOME)
+        self.assertEqual(c["NOT_HOME"], "$HOMEX/y")
+        self.assertEqual(c["TILDE_USER"], "~root/x")
+
+    def test_empty_env_var_does_not_hide_the_file(self):
+        with mock.patch.dict(sk_common._CONFIG, {"SESSION_KEEPER_GC_PREFIX": "file"}), \
+                mock.patch.dict(os.environ, {"SESSION_KEEPER_GC_PREFIX": ""}):
+            self.assertEqual(sk_common.cfg("SESSION_KEEPER_GC_PREFIX"), "file")
 
     def test_run_missing_program_returns_127(self):
         r = sk_common.run(["definitely-not-a-program-sk"])
@@ -471,6 +497,124 @@ class TestReopen(Base):
         self.assertIn("trust this folder", save_mod.why_not_up(SID_A))
 
 
+class TestUserCommands(Base):
+    """SESSION_KEEPER_PRE_SAVE / PRE_REOPEN (+ FAIL_ENV) / POST_BOOT / DROP_ENV."""
+    make_save = TestReopen.make_save
+
+    def user_calls(self):
+        return [c for c in self.fs.calls if c[0] == "user-cmd"]
+
+    def test_pre_save_runs_before_manual_save_only(self):
+        self.world()
+        os.environ["SESSION_KEEPER_PRE_SAVE"] = "user-cmd 1 not ready"
+        rc, out = self.out(save_mod.save, False)
+        self.assertEqual(rc, 0)
+        self.assertIn("warning: SESSION_KEEPER_PRE_SAVE failed (exit 1) before saving: not ready", out)
+        self.assertTrue(os.path.exists(save_mod.SAVE))          # a failed check does not block the save
+        n = len(self.user_calls())
+        self.out(save_mod.save, True)                            # dry-run: not run
+        self.assertEqual(len(self.user_calls()), n)
+
+    def test_pre_reopen_ok_changes_nothing(self):
+        self.make_save()
+        os.environ["SESSION_KEEPER_PRE_REOPEN"] = "user-cmd 0 fine"
+        os.environ["SESSION_KEEPER_PRE_REOPEN_FAIL_ENV"] = "NO_SECRETS=1"
+        rc, out = self.out(save_mod.reopen, save_mod.SAVE, False, False, argv=["--reopen", "--keep-window"])
+        self.assertEqual(len(self.user_calls()), 1)
+        self.assertNotIn("warning", out)
+        self.assertFalse([c for c in self.fs.created if "NO_SECRETS" in c])
+
+    def test_pre_reopen_failure_adds_env_to_claude_commands(self):
+        self.make_save()
+        os.environ["SESSION_KEEPER_PRE_REOPEN"] = "user-cmd 1 vault locked"
+        os.environ["SESSION_KEEPER_PRE_REOPEN_FAIL_ENV"] = "NO_SECRETS=1 'NOTE=a b'"
+        rc, out = self.out(save_mod.reopen, save_mod.SAVE, False, False, argv=["--reopen", "--keep-window"])
+        self.assertIn("SESSION_KEEPER_PRE_REOPEN failed (exit 1) before reopening: vault locked", out)
+        claude = [c for c in self.fs.created if "claude --resume" in c]
+        self.assertEqual(len(claude), 3)
+        for c in claude:
+            self.assertIn(" NO_SECRETS=1 NOTE='a b' claude --resume ", c)
+        self.assertFalse([c for c in self.fs.created if "claude --resume" not in c and "NO_SECRETS" in c])
+
+    def test_pre_reopen_not_run_on_dry_run(self):
+        self.make_save()
+        os.environ["SESSION_KEEPER_PRE_REOPEN"] = "user-cmd 1 x"
+        self.out(save_mod.reopen, save_mod.SAVE, True, False, argv=["--reopen", "--dry-run"])
+        self.assertEqual(self.user_calls(), [])
+
+    def test_env_assignments_ignores_junk(self):
+        self.assertEqual(save_mod.env_assignments("not-an-assignment A=1 'B=x y'"), [("A", "1"), ("B", "x y")])
+        self.assertEqual(save_mod.env_assignments("'unbalanced"), [])
+
+    def test_fail_env_with_and_in_folder_name(self):
+        # review #5: the env used to be inserted at the first " && ", which can be inside the quoted folder
+        self.make_save()
+        d = self.saved()
+        weird = "/srv/a && b"  # no backslashes: AppleScript escaping would double them on Windows
+        for w in d["windows"]:
+            if w.get("claude_id") == SID_B:
+                w["resume"]["cwd"] = weird
+        with open(save_mod.SAVE, "w") as f:
+            json.dump(d, f)
+        os.environ["SESSION_KEEPER_PRE_REOPEN"] = "user-cmd 1 locked"
+        os.environ["SESSION_KEEPER_PRE_REOPEN_FAIL_ENV"] = "NO_SECRETS=1"
+        self.out(save_mod.reopen, save_mod.SAVE, False, False, argv=["--reopen", "--keep-window"])
+        c = [c for c in self.fs.created if SID_B in c][0]
+        self.assertIn(f"cd {shlex.quote(weird)} && NO_SECRETS=1 claude --resume {SID_B}", c)
+
+    def test_fail_env_comes_after_kept_env(self):
+        # review #8: a kept variable of the same name must not win over the fail env
+        self.make_save()
+        os.environ["SESSION_KEEPER_PRE_REOPEN"] = "user-cmd 1 locked"
+        os.environ["SESSION_KEEPER_PRE_REOPEN_FAIL_ENV"] = "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0"
+        self.out(save_mod.reopen, save_mod.SAVE, False, False, argv=["--reopen", "--keep-window"])
+        c = [c for c in self.fs.created if SID_A in c][0]
+        self.assertIn("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0 claude", c)
+
+    def test_pre_reopen_failure_is_notified(self):
+        # review #7: the reopen window closes, so the warning must also reach the notifier
+        self.make_save()
+        os.environ["SESSION_KEEPER_PRE_REOPEN"] = "user-cmd 1 vault locked"
+        os.environ["SESSION_KEEPER_NOTIFY"] = "notifier"
+        rc, out = self.out(save_mod.reopen, save_mod.SAVE, False, False, argv=["--reopen", "--keep-window"])
+        self.assertIn("done: 3 of 3", out)
+        sent = [c for c in self.fs.calls if c[0] == "notifier"]
+        self.assertEqual(len(sent), 1)
+        self.assertIn("SESSION_KEEPER_PRE_REOPEN failed (exit 1) before reopening: vault locked", sent[0][1])
+
+    def test_bad_hook_timeout_does_not_crash(self):
+        # review #1: float() on a bad value used to raise inside save/reopen
+        self.world()
+        os.environ["SESSION_KEEPER_PRE_SAVE"] = "user-cmd 0 fine"
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"SESSION_KEEPER_HOOK_TIMEOUT": "ten"}), mock.patch("sys.stderr", err):
+            rc, out = self.out(save_mod.save, False)
+        self.assertEqual(rc, 0)
+        self.assertIn("SESSION_KEEPER_HOOK_TIMEOUT='ten' is not a number; using 30", err.getvalue())
+        self.assertTrue(os.path.exists(save_mod.SAVE))
+
+    def test_post_boot_sends_output_to_notifier(self):
+        os.environ["SESSION_KEEPER_POST_BOOT"] = "user-cmd 0 Mac restarted, 3 sessions"
+        os.environ["SESSION_KEEPER_NOTIFY"] = "notifier"
+        rc, out = self.out(save_mod.main, argv=["--post-boot"])
+        self.assertEqual(rc, 0)
+        self.assertIn(["notifier", "Mac restarted, 3 sessions"], self.fs.calls)
+
+    def test_post_boot_silent_output_and_unset(self):
+        os.environ["SESSION_KEEPER_NOTIFY"] = "notifier"
+        os.environ["SESSION_KEEPER_POST_BOOT"] = "user-cmd 0"
+        self.assertEqual(self.out(save_mod.main, argv=["--post-boot"])[0], 0)
+        os.environ.pop("SESSION_KEEPER_POST_BOOT")
+        self.assertEqual(self.out(save_mod.main, argv=["--post-boot"])[0], 0)
+        self.assertFalse([c for c in self.fs.calls if c[0] == "notifier"])
+
+    def test_drop_env_from_new_iterm(self):
+        with mock.patch.dict(os.environ, {"SECRET_LOADED": "1", "KEEP_ME": "1", "SESSION_KEEPER_DROP_ENV": "SECRET_LOADED"}):
+            env = cir.clean_env()
+        self.assertNotIn("SECRET_LOADED", env)
+        self.assertIn("KEEP_ME", env)
+
+
 class TestTmuxGc(Base):
     def test_closes_only_empty_old_detached_sessions(self):
         old = int(time.time()) - 3600
@@ -543,6 +687,122 @@ class TestFolderTitle(unittest.TestCase):
         r = subprocess.run([sys.executable, self.BIN], input="not json", capture_output=True, text=True,
                            env=dict(os.environ, SESSION_KEEPER_FOLDER_TITLE="1"))
         self.assertEqual((r.returncode, r.stdout), (0, ""))
+
+
+class TestSeedConfig(unittest.TestCase):
+    """The first run creates ~/.config/session-keeper/config from config.example, and never touches a file
+    that already exists. Runs in subprocesses with a temp HOME (the config path is fixed at import)."""
+    STARTER = os.path.join(ROOT, "config.example")
+
+    def setUp(self):
+        self.t = tempfile.mkdtemp(prefix="sk-seed-")
+        self.home = os.path.join(self.t, "home")
+        os.makedirs(self.home)
+        self.env = {k: v for k, v in os.environ.items()
+                    if not k.startswith(("SESSION_KEEPER", "CLAUDE", "XDG_CONFIG_HOME"))}
+        self.env.update(HOME=self.home, USERPROFILE=self.home,
+                        SESSION_KEEPER_STATE_DIR=os.path.join(self.t, "state"),
+                        SESSION_KEEPER_LOG_DIR=os.path.join(self.t, "logs"))
+        self.dest = os.path.join(self.home, ".config", "session-keeper", "config")
+
+    def tearDown(self):
+        shutil.rmtree(self.t, ignore_errors=True)
+
+    def seed(self, **env):
+        return subprocess.run([sys.executable, os.path.join(ROOT, "lib", "sk_common.py"), "--seed"],
+                              capture_output=True, text=True, env=dict(self.env, **env))
+
+    def bytes(self, p):
+        with open(p, "rb") as f:
+            return f.read()
+
+    def test_missing_config_is_created_with_the_defaults(self):
+        r = self.seed()
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+        self.assertEqual(self.bytes(self.dest), self.bytes(self.STARTER))
+
+    @unittest.skipIf(os.name == "nt", "file modes are POSIX")
+    def test_created_file_is_private(self):
+        # It is meant to hold commands (SESSION_KEEPER_NOTIFY, _PRE_*) that may carry a token.
+        self.assertEqual(self.seed().returncode, 0)
+        self.assertEqual(os.stat(self.dest).st_mode & 0o777, 0o600)
+
+    def test_claude_save_seeds_on_first_use(self):
+        r = subprocess.run([sys.executable, os.path.join(ROOT, "bin", "claude-save"), "--reopen", "--file",
+                            os.path.join(self.t, "no-such-save.json")], capture_output=True, text=True, env=self.env)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertEqual(self.bytes(self.dest), self.bytes(self.STARTER))
+
+    def test_help_and_dry_run_leave_a_missing_config_missing(self):
+        save = os.path.join(self.t, "save.json")
+        with open(save, "w") as f:
+            json.dump({"sessions": []}, f)
+        for args in (["--help"], ["help"], ["--dry-run"], ["--reopen", "--dry-run", "--file", save], ["--bogus"]):
+            subprocess.run([sys.executable, os.path.join(ROOT, "bin", "claude-save"), *args],
+                           capture_output=True, text=True, env=self.env, timeout=60)
+            self.assertFalse(os.path.exists(os.path.join(self.home, ".config")), args)
+
+    def test_existing_config_is_never_changed(self):
+        os.makedirs(os.path.dirname(self.dest))
+        with open(self.dest, "wb") as f:
+            f.write(b"SESSION_KEEPER_GC_PREFIX=mine-\r\n")
+        os.utime(self.dest, (1000000000, 1000000000))
+        for _ in range(2):
+            self.assertEqual(self.seed().returncode, 0)
+        self.assertEqual(self.bytes(self.dest), b"SESSION_KEEPER_GC_PREFIX=mine-\r\n")
+        self.assertEqual(os.stat(self.dest).st_mtime, 1000000000)
+
+    def test_env_overrides_are_respected(self):
+        alt = os.path.join(self.t, "alt", "sk.conf")
+        self.assertEqual(self.seed(SESSION_KEEPER_CONFIG=alt, XDG_CONFIG_HOME=os.path.join(self.t, "x")).returncode, 0)
+        self.assertEqual(self.bytes(alt), self.bytes(self.STARTER))
+        self.assertFalse(os.path.exists(os.path.join(self.t, "x")))
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".config")))
+        xdg = os.path.join(self.t, "xdg")
+        self.assertEqual(self.seed(XDG_CONFIG_HOME=xdg).returncode, 0)
+        self.assertEqual(self.bytes(os.path.join(xdg, "session-keeper", "config")), self.bytes(self.STARTER))
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".config")))
+
+    def test_unwritable_place_does_not_crash(self):
+        with open(os.path.join(self.home, ".config"), "w") as f:   # a file where the folder should be
+            f.write("x")
+        r = self.seed()
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                     "read-only folders are not enforced for Windows or root")
+    def test_read_only_folder_does_not_crash(self):
+        cfgdir = os.path.join(self.home, ".config")
+        os.makedirs(cfgdir)
+        os.chmod(cfgdir, 0o500)
+        try:
+            r = self.seed()
+            self.assertEqual((r.returncode, r.stderr), (0, ""))
+            self.assertEqual(os.listdir(cfgdir), [])
+        finally:
+            os.chmod(cfgdir, 0o700)
+
+    def test_seeded_config_behaves_like_no_config(self):
+        """The starter sets nothing: the reader gets no setting from it, and every option listed in it still
+        resolves to its built-in default."""
+        self.assertEqual(sk_common._read_config(self.STARTER), {})
+        code = ("import json,sys; sys.path.insert(0, sys.argv[1]); import sk_common as s; "
+                "keys = sorted(l.split('=')[0].lstrip('# ').strip() for l in open(sys.argv[2]) "
+                "if l.startswith('# ') and '=' in l and l[2:].split('=')[0].isupper()); "
+                "print(json.dumps([s._CONFIG, {k: s.cfg(k, 'DEFAULT') for k in keys}, s.state_dir(), s.log_dir()]))")
+        outs = []
+        for seeded in (False, True):
+            if seeded:
+                self.assertEqual(self.seed().returncode, 0)
+                self.assertTrue(os.path.isfile(self.dest))
+            else:
+                self.assertFalse(os.path.exists(self.dest))
+            r = subprocess.run([sys.executable, "-c", code, os.path.join(ROOT, "lib"), self.STARTER],
+                               capture_output=True, text=True, env=self.env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            outs.append(json.loads(r.stdout))
+        self.assertEqual(outs[0], outs[1])
+        self.assertGreater(len(outs[0][1]), 30)   # every option of the starter was checked
 
 
 if __name__ == "__main__":

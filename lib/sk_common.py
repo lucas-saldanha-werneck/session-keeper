@@ -15,7 +15,23 @@ CONFIG_FILE = os.environ.get("SESSION_KEEPER_CONFIG") or os.path.join(
     os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "session-keeper", "config")
 
 
+# Settings that hold one path: their slashes are normalized (Windows: "C:\\Users\\me/x" -> "C:\\Users\\me\\x").
+# Never applied to other settings: a command line or a URL must reach its program as written.
+PATH_KEYS = {"SESSION_KEEPER_STATE_DIR", "SESSION_KEEPER_LOG_DIR", "SESSION_KEEPER_TMUX", "SESSION_KEEPER_SHELL",
+             "SESSION_KEEPER_ITERM_APP", "CLAUDE_AUTO_RETRY_LAUNCHER"}
+
+
+def _expand_home(v):
+    """Only a leading ~ or $HOME / ${HOME} (alone or followed by /) becomes the home folder; nothing else is
+    expanded. lib/sk_config.sh follows the same rule."""
+    for prefix in ("~", "$HOME", "${HOME}"):
+        if v == prefix or v.startswith(prefix + "/"):
+            return HOME + v[len(prefix):]
+    return v
+
+
 def _read_config(path):
+    """KEY=VALUE lines, shell style. Same rules as sk_load_config in lib/sk_config.sh."""
     out = {}
     try:
         with open(path) as f:
@@ -30,9 +46,9 @@ def _read_config(path):
                 v = v.strip()
                 if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
                     v = v[1:-1]
-                v = os.path.expandvars(os.path.expanduser(v))
-                if v.startswith(HOME):
-                    v = os.path.normpath(v)  # Windows: "C:\\Users\\me/x" -> "C:\\Users\\me\\x"
+                v = _expand_home(v)
+                if k in PATH_KEYS and v:
+                    v = os.path.normpath(v)
                 out[k] = v
     except OSError:
         pass
@@ -41,13 +57,55 @@ def _read_config(path):
 
 _CONFIG = _read_config(CONFIG_FILE)
 
+# The starter config: config.example at the plugin / repo root, or in ~/.local/share/session-keeper as copied by
+# install.sh. Both are one folder above lib/.
+STARTER = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "config.example")
+
+
+def seed_config(dest=None, starter=None):
+    """First run: copy the starter to the config file when that file does not exist, creating its folder.
+    Never overwrites or changes an existing file, never raises, prints nothing. Returns the path it wrote,
+    else None. The starter has every option commented out, so it behaves exactly like no file."""
+    dest = dest or CONFIG_FILE
+    starter = starter or STARTER
+    try:
+        if os.path.lexists(dest) or not os.path.isfile(starter):
+            return None
+        with open(starter, "rb") as f:
+            data = f.read()
+        os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+        # O_EXCL: a file that appears between the check and here is left alone
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)  # private: it may hold commands with tokens
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+        except Exception:
+            try:
+                os.remove(dest)   # created by us a moment ago: do not leave half a file
+            except OSError:
+                pass
+            return None
+        return dest
+    except Exception:
+        return None
+
 
 def cfg(name, default=""):
     """Setting from the environment, else the config file, else default."""
-    v = os.environ.get(name)
-    if v is None:
-        v = _CONFIG.get(name)
+    v = os.environ.get(name) or _CONFIG.get(name)  # a non-empty environment variable wins, as in sk_config.sh
     return default if v is None or v == "" else v
+
+
+def cfg_number(name, default):
+    """A numeric setting; a value that is not a number falls back to `default` with a warning on stderr."""
+    raw = cfg(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"warning: {name}={raw!r} is not a number; using {default:g}", file=sys.stderr)
+        return default
 
 
 def claude_dir():
@@ -111,6 +169,26 @@ def make_logger(filename, quiet=False):
     return log
 
 
+def run_configured(name, log=None):
+    """Run the command in setting `name` (split like a shell line, no pipes; wrap those in `sh -c '...'`).
+    Returns None when the setting is empty, else a CompletedProcess. A timeout
+    (SESSION_KEEPER_HOOK_TIMEOUT seconds, default 30) or a crash comes back as code 124 / 127."""
+    cmd = cfg(name)
+    if not cmd:
+        return None
+    import shlex
+    timeout = cfg_number("SESSION_KEEPER_HOOK_TIMEOUT", 30.0)
+    try:
+        r = run(shlex.split(cmd), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        r = subprocess.CompletedProcess(cmd, 124, "", f"timed out after {timeout:g} s")
+    except Exception as e:  # a bad setting must never break a save or a restore
+        r = subprocess.CompletedProcess(cmd, 127, "", str(e))
+    if log:
+        log(f"{name}: rc={r.returncode} {((r.stdout or '') + (r.stderr or '')).strip()[:120]}")
+    return r
+
+
 def notify(text, log=None):
     """Send one line of text through SESSION_KEEPER_NOTIFY (any program that takes the text as its only
     argument, e.g. a push-message script). Not set = just print it."""
@@ -128,3 +206,9 @@ def notify(text, log=None):
         if log:
             log(f"notify failed: {e}")
         return False
+
+
+if __name__ == "__main__":   # the plugin's SessionStart hook: python3 lib/sk_common.py --seed
+    if "--seed" in sys.argv[1:]:
+        seed_config()
+    sys.exit(0)

@@ -4,7 +4,7 @@ set -u
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 PY="$(command -v python3 || command -v python)"
 rc=0
-"$PY" -m py_compile lib/sk_common.py && for f in bin/claude-save bin/claude-iterm-restart bin/claude-restart-app bin/claude-tmux-gc bin/claude-folder-title; do
+bash -n lib/sk_config.sh && "$PY" -m py_compile lib/sk_common.py && for f in bin/claude-save bin/claude-iterm-restart bin/claude-restart-app bin/claude-tmux-gc bin/claude-folder-title; do
   "$PY" -c 'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")' "$f" || rc=1
 done
 for f in bin/claude-restart bin/claude-boot-reopen install.sh tests/*.sh; do bash -n "$f" || rc=1; done

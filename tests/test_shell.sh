@@ -122,6 +122,80 @@ echo "== claude-boot-reopen"
 BLOG="$(ls "$T"/home/Library/Logs/claude-boot-reopen.log "$T"/home/.local/state/session-keeper/logs/claude-boot-reopen.log 2>/dev/null | head -1)"
 has "without iTerm it runs claude-save --reopen directly" "no iTerm2: running claude-save --reopen --dry-run" "$(cat "$BLOG" 2>/dev/null)"
 has "and claude-save reports there is no save yet" "Run claude-save before restarting" "$(cat "$BLOG" 2>/dev/null)"
+hasnt "no post-boot command when none is set" "post-boot" "$(cat "$BLOG" 2>/dev/null)"
+SESSION_KEEPER_POST_BOOT="echo hi" "$ROOT/bin/claude-boot-reopen" --dry-run
+has "--dry-run only names the post-boot command" "dry-run: would run the post-boot command: echo hi" "$(cat "$BLOG")"
+# claude-boot-reopen sets its own PATH (launchd has almost none): ~/.local/bin is on it, our fakes are not
+UB="$T/home/.local/bin"; mkdir -p "$UB"
+printf '#!/bin/bash\necho "$*" >>"$FAKE_DIR/notified"\n' >"$UB/notifier"; chmod +x "$UB/notifier"
+printf '#!/bin/bash\necho "restarted: $1"\n' >"$UB/boot-report"; chmod +x "$UB/boot-report"
+printf 'SESSION_KEEPER_POST_BOOT=boot-report "two words"\nSESSION_KEEPER_NOTIFY="notifier"\nSESSION_KEEPER_POST_BOOT_DELAY=0\n' >"$T/sk-config"
+SESSION_KEEPER_CONFIG="$T/sk-config" "$ROOT/bin/claude-boot-reopen"
+has "post-boot runs after the reopen (config file)" "post-boot finished (exit 0)" "$(cat "$BLOG")"
+has "what it prints goes to the notifier" "restarted: two words" "$(cat "$T/notified" 2>/dev/null)"
+printf 'SESSION_KEEPER_POST_BOOT=boot-report-missing\n' >"$T/sk-config"
+SESSION_KEEPER_CONFIG="$T/sk-config" "$ROOT/bin/claude-boot-reopen"
+rm -f "$UB/notifier" "$UB/boot-report"
+has "a failing post-boot command is logged with its exit code" "post-boot finished (exit 1)" "$(cat "$BLOG")"
+
+echo "== claude-boot-reopen: post-boot only after the reopen, with its result (review #2)"
+UB="$T/home/.local/bin"; mkdir -p "$UB"; L2="$T/blogs"; B2="$L2/claude-boot-reopen.log"
+printf '#!/bin/bash\necho "$*" >>"$FAKE_DIR/notified"\n' >"$UB/notifier"
+printf '#!/bin/bash\necho "result=$SESSION_KEEPER_REOPEN_RESULT up=$SESSION_KEEPER_REOPEN_UP total=$SESSION_KEEPER_REOPEN_TOTAL"\n' >"$UB/boot-report"
+printf '#!/bin/bash\necho Darwin\n' >"$UB/uname"
+# fake osascript that, like iTerm, runs the reopen.command in the background
+printf '#!/bin/bash\nc="$(sed -n "s/.* -l \\(.*\\)\\"$/\\1/p" <<<"$2")"\n[ -n "$c" ] && (bash "$c" </dev/null >/dev/null 2>&1 &)\nexit 0\n' >"$UB/osascript"
+chmod +x "$UB"/*
+mkdir -p "$T/iTerm.app"
+printf 'SESSION_KEEPER_POST_BOOT=boot-report\nSESSION_KEEPER_NOTIFY=notifier\n' >"$T/sk-config2"
+: >"$T/notified"
+SHELL=/bin/bash SESSION_KEEPER_CONFIG="$T/sk-config2" SESSION_KEEPER_ITERM_APP="$T/iTerm.app" SESSION_KEEPER_LOG_DIR="$L2" \
+  CLAUDE_BOOT_REOPEN_DELAY=0 SESSION_KEEPER_POST_BOOT_WAIT=30 "$ROOT/bin/claude-boot-reopen"
+has "iTerm path: waits for the reopen window, then passes its result" "result=failed up= total=" "$(cat "$T/notified")"
+has "the result is logged before the post-boot command" "reopen result: failed" "$(cat "$B2")"
+o="$(grep -n 'reopen result' "$B2" | head -1 | cut -d: -f1)"; f="$(grep -n 'post-boot finished' "$B2" | head -1 | cut -d: -f1)"
+[[ -n "$o" && -n "$f" && "$o" -lt "$f" ]] && ok "post-boot runs after the reopen finished" || bad "post-boot order" "$(cat "$B2")"
+
+: >"$T/notified"; : >"$B2"
+printf '#!/bin/bash\nexit 1\n' >"$UB/osascript"; chmod +x "$UB/osascript"
+SHELL=/bin/bash SESSION_KEEPER_CONFIG="$T/sk-config2" SESSION_KEEPER_ITERM_APP="$T/iTerm.app" SESSION_KEEPER_LOG_DIR="$L2" \
+  CLAUDE_BOOT_REOPEN_DELAY=0 CLAUDE_BOOT_RETRY_DELAY=0 SESSION_KEEPER_POST_BOOT_WAIT=2 "$ROOT/bin/claude-boot-reopen"; rc=$?
+[[ $rc -eq 1 ]] && ok "iTerm could not be opened: exit 1" || bad "iTerm could not be opened: exit 1" "rc=$rc"
+hasnt "and the post-boot command is skipped" "result=" "$(cat "$T/notified")"
+has "the failure goes to the notifier instead" "could not open iTerm after login" "$(cat "$T/notified")"
+rm -f "$UB/uname" "$UB/osascript" "$UB/notifier" "$UB/boot-report"
+
+echo "== config readers agree (review #3, #4, #6, #10)"
+cat >"$T/parity.conf" <<'PARITY'
+# comment
+P_PLAIN=plain value
+P_SQ='single quoted $HOME'
+P_DQ="double quoted"
+P_INNER=cmd "two words" 'and $X'
+P_TILDE=~/x
+P_TILDE_ONLY=~
+P_TILDE_USER=~root/x
+P_HOME=$HOME/bin/push --url https://example.com//a
+P_HOME_BRACES=${HOME}
+P_HOMEX=$HOMEX/y
+P_VAR=$USER and ${PATH}
+  export P_EXPORT = spaced
+P_EMPTY=
+P_EQ=a=b=c
+NOT A KEY=1
+P_CRLF=windows
+PARITY
+printf 'P_CR=x\r\n' >>"$T/parity.conf"
+keys="P_PLAIN P_SQ P_DQ P_INNER P_TILDE P_TILDE_ONLY P_TILDE_USER P_HOME P_HOME_BRACES P_HOMEX P_VAR P_EXPORT P_EMPTY P_EQ P_CRLF P_CR"
+PYV="$(cd "$ROOT" && python3 -c 'import sys; sys.path.insert(0, "lib"); import sk_common as c
+d = c._read_config(sys.argv[1])
+for k in sys.argv[2].split(): print(k + "=" + d.get(k, "<unset>"))' "$T/parity.conf" "$keys")"
+SHV="$(env -i HOME="$HOME" PATH="$PATH" bash -c '. "$1/lib/sk_config.sh"; sk_load_config "$2"
+for k in $3; do if [[ -n "${!k+x}" ]]; then printf "%s=%s\n" "$k" "${!k}"; else printf "%s=<unset>\n" "$k"; fi; done' _ "$ROOT" "$T/parity.conf" "$keys")"
+if [[ "$PYV" == "$SHV" ]]; then ok "Python and bash readers give the same values"; else bad "readers differ" "$(diff <(echo "$PYV") <(echo "$SHV"))"; fi
+has "single-quoted \$HOME is not expanded" "P_SQ=single quoted \$HOME" "$SHV"
+has "a URL inside a command keeps its //" "P_HOME=$HOME/bin/push --url https://example.com//a" "$SHV"
+has "other variables are not expanded" 'P_VAR=$USER and ${PATH}' "$SHV"
 
 echo "== install.sh"
 : >"$T/calls"
@@ -136,6 +210,18 @@ done
 ok "all 7 commands linked"
 out2="$("$T/home/.local/bin/claude-save" --dry-run 2>&1)"
 has "installed claude-save runs from its symlink (finds lib/)" "dry-run: nothing saved" "$out2"
+SEEDED="$T/seeded/session-keeper/config"
+SESSION_KEEPER_CONFIG="$SEEDED" "$T/home/.local/bin/claude-save" --dry-run >/dev/null 2>&1
+[[ ! -e "$SEEDED" ]] && ok "installed claude-save --dry-run does not create the config" || bad "--dry-run created the config"
+SESSION_KEEPER_CONFIG="$SEEDED" "$T/home/.local/bin/claude-save" --reopen --file "$T/no-such-save.json" >/dev/null 2>&1
+cmp -s "$SEEDED" "$ROOT/config.example" && ok "installed claude-save seeds the config from its installed starter" \
+  || bad "installed claude-save seeds the config" "$(ls -la "$T/seeded/session-keeper" "$T/home/.local/share/session-keeper" 2>&1)"
+SHV="$(env -i HOME="$HOME" PATH="$PATH" bash -c '. "$1/lib/sk_config.sh"; before="$(export -p)"; sk_load_config "$2"
+[[ "$(export -p)" == "$before" ]] && echo same' _ "$ROOT" "$SEEDED")"
+[[ "$SHV" == same ]] && ok "the bash reader exports nothing from the seeded config" || bad "bash reader exported from the starter"
+out2="$("$T/home/.local/bin/claude-restart" --pending 2>&1)"; rc=$?
+[[ $rc -eq 0 ]] && hasnt "installed claude-restart finds lib/sk_config.sh through its symlink" "sk_config.sh" "$out2" \
+  || bad "installed claude-restart runs from its symlink" "rc=$rc $out2"
 A="$T/home/Library/LaunchAgents"
 for l in autosave tmux-gc boot-reopen; do
   f="$A/org.example.sk.$l.plist"
