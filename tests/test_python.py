@@ -550,7 +550,7 @@ class TestUserCommands(Base):
         # review #5: the env used to be inserted at the first " && ", which can be inside the quoted folder
         self.make_save()
         d = self.saved()
-        weird = os.path.join(HOME, "a && b")
+        weird = "/srv/a && b"  # no backslashes: AppleScript escaping would double them on Windows
         for w in d["windows"]:
             if w.get("claude_id") == SID_B:
                 w["resume"]["cwd"] = weird
