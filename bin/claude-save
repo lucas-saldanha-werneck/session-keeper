@@ -45,7 +45,7 @@ from importlib.machinery import SourceFileLoader
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(BIN), "lib"))
-from sk_common import HOME, cfg, claude_dir, make_logger, notify, run_configured, short_path, state_dir  # noqa: E402
+from sk_common import HOME, cfg, claude_dir, make_logger, notify, run_configured, seed_config, short_path, state_dir  # noqa: E402
 
 _ld = SourceFileLoader("claude_iterm_restart", os.path.join(BIN, "claude-iterm-restart"))
 _sp = importlib.util.spec_from_loader("claude_iterm_restart", _ld)
@@ -648,6 +648,7 @@ def main():
     if a[:1] and a[0] in ("-h", "--help", "help"):
         print(__doc__)
         return 0
+    seed_config()   # first run: create ~/.config/session-keeper/config from the starter (never changes it)
     if "--reopen" in a:
         if "--file" in a:
             i = a.index("--file")

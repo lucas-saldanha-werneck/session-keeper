@@ -1,0 +1,98 @@
+# session-keeper settings: KEY=VALUE lines, # starts a comment.
+# Every option is listed with its default and commented out, so this file changes nothing until you
+# remove the # in front of a line and edit its value. A variable set in the environment wins over this file.
+# Details: README, "Configuration".
+
+# Saves, history copies (last 10) and the iTerm2 snapshot
+# SESSION_KEEPER_STATE_DIR=~/.local/state/session-keeper
+
+# Log files (default on macOS; elsewhere <state dir>/logs)
+# SESSION_KEEPER_LOG_DIR=~/Library/Logs
+
+# A command that gets one line of text when --reopen finds sessions that did not come back (empty: none)
+# SESSION_KEEPER_NOTIFY=
+
+# Extra arguments added to every `claude --resume`, e.g. --remote-control (empty: none)
+# SESSION_KEEPER_CLAUDE_ARGS=
+
+# Environment variables copied from each running Claude into its resume command
+# SESSION_KEEPER_KEEP_ENV=CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS CLAUDE_CODE_DISABLE_NOTIFICATION_PRESENCE_CHECK
+
+# tmux session names claude-save skips (empty: none)
+# SESSION_KEEPER_IGNORE_SESSIONS=
+
+# Path to tmux (empty: found on PATH or in Homebrew)
+# SESSION_KEEPER_TMUX=
+
+# Shell used for detached tmux sessions and typed-back commands (empty: $SHELL, else /bin/zsh)
+# SESSION_KEEPER_SHELL=
+
+# Where iTerm2 is
+# SESSION_KEEPER_ITERM_APP=/Applications/iTerm.app
+
+# claude-restart only considers tmux sessions whose name starts with this (empty: all)
+# SESSION_KEEPER_TMUX_PREFIX=
+
+# claude-tmux-gc only closes sessions whose name starts with this
+# SESSION_KEEPER_GC_PREFIX=claude-
+
+# 1 turns on the folder-title hook (empty: off, or the plugin option folder_title)
+# SESSION_KEEPER_FOLDER_TITLE=
+
+# Colon-separated folders that titles are relative to, e.g. ~/Projects (empty: ~/<path>)
+# SESSION_KEEPER_TITLE_ROOTS=
+
+# Desktop app: a command that gets "<session id> <message>" after claude-restart stopped an app session
+# SESSION_KEEPER_APP_NUDGE=
+
+# Desktop app log claude-restart-app reads
+# SESSION_KEEPER_APP_LOG=~/Library/Logs/Claude/main.log
+
+# claude-auto-retry launcher.js claude-restart restarts through (empty: looked up in the Homebrew/npm global folders)
+# CLAUDE_AUTO_RETRY_LAUNCHER=
+
+# Seconds --reopen waits for the conversations to come up
+# CLAUDE_SAVE_WAIT=60
+
+# Seconds --reopen waits in a new window-less tmux session before typing its saved command back
+# CLAUDE_SAVE_TYPE_DELAY=1
+
+# Seconds claude-restart-app waits for the desktop app to close the session's turn
+# CLAUDE_RESTART_APP_WAIT=60
+
+# Seconds between claude-restart's checks that the session finished its turn
+# CLAUDE_RESTART_POLL=5
+
+# Seconds before claude-restart fires the restart
+# CLAUDE_RESTART_FIRE_DELAY=2
+
+# Seconds the "kill and reopen?" dialog of claude-restart waits for an answer
+# CLAUDE_RESTART_GIVEUP=600
+
+# Seconds claude-boot-reopen waits after login before reopening, and between retries
+# CLAUDE_BOOT_REOPEN_DELAY=20
+# CLAUDE_BOOT_RETRY_DELAY=10
+
+# A command run before a manual claude-save (empty: none). A failure only warns
+# SESSION_KEEPER_PRE_SAVE=
+
+# A command run before --reopen opens anything (empty: none). A failure only warns
+# SESSION_KEEPER_PRE_REOPEN=
+
+# KEY=VALUE pairs put in front of every resumed claude when SESSION_KEEPER_PRE_REOPEN failed (empty: none)
+# SESSION_KEEPER_PRE_REOPEN_FAIL_ENV=
+
+# A command claude-boot-reopen runs once the reopen has finished (empty: none)
+# SESSION_KEEPER_POST_BOOT=
+
+# Longest wait, in seconds, for the reopen to finish before the post-boot command runs anyway
+# SESSION_KEEPER_POST_BOOT_WAIT=600
+
+# Extra seconds after the reopen finished, before the post-boot command
+# SESSION_KEEPER_POST_BOOT_DELAY=0
+
+# Seconds each of the three commands above may take
+# SESSION_KEEPER_HOOK_TIMEOUT=30
+
+# Extra variables (space-separated) not passed to an iTerm2 that session-keeper launches (empty: none)
+# SESSION_KEEPER_DROP_ENV=

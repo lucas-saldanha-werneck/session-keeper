@@ -689,6 +689,107 @@ class TestFolderTitle(unittest.TestCase):
         self.assertEqual((r.returncode, r.stdout), (0, ""))
 
 
+class TestSeedConfig(unittest.TestCase):
+    """The first run creates ~/.config/session-keeper/config from config.example, and never touches a file
+    that already exists. Runs in subprocesses with a temp HOME (the config path is fixed at import)."""
+    STARTER = os.path.join(ROOT, "config.example")
+
+    def setUp(self):
+        self.t = tempfile.mkdtemp(prefix="sk-seed-")
+        self.home = os.path.join(self.t, "home")
+        os.makedirs(self.home)
+        self.env = {k: v for k, v in os.environ.items()
+                    if not k.startswith(("SESSION_KEEPER", "CLAUDE", "XDG_CONFIG_HOME"))}
+        self.env.update(HOME=self.home, USERPROFILE=self.home,
+                        SESSION_KEEPER_STATE_DIR=os.path.join(self.t, "state"),
+                        SESSION_KEEPER_LOG_DIR=os.path.join(self.t, "logs"))
+        self.dest = os.path.join(self.home, ".config", "session-keeper", "config")
+
+    def tearDown(self):
+        shutil.rmtree(self.t, ignore_errors=True)
+
+    def seed(self, **env):
+        return subprocess.run([sys.executable, os.path.join(ROOT, "lib", "sk_common.py"), "--seed"],
+                              capture_output=True, text=True, env=dict(self.env, **env))
+
+    def bytes(self, p):
+        with open(p, "rb") as f:
+            return f.read()
+
+    def test_missing_config_is_created_with_the_defaults(self):
+        r = self.seed()
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+        self.assertEqual(self.bytes(self.dest), self.bytes(self.STARTER))
+
+    def test_claude_save_seeds_on_first_use(self):
+        r = subprocess.run([sys.executable, os.path.join(ROOT, "bin", "claude-save"), "--reopen", "--file",
+                            os.path.join(self.t, "no-such-save.json")], capture_output=True, text=True, env=self.env)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertEqual(self.bytes(self.dest), self.bytes(self.STARTER))
+
+    def test_existing_config_is_never_changed(self):
+        os.makedirs(os.path.dirname(self.dest))
+        with open(self.dest, "wb") as f:
+            f.write(b"SESSION_KEEPER_GC_PREFIX=mine-\r\n")
+        os.utime(self.dest, (1000000000, 1000000000))
+        for _ in range(2):
+            self.assertEqual(self.seed().returncode, 0)
+        self.assertEqual(self.bytes(self.dest), b"SESSION_KEEPER_GC_PREFIX=mine-\r\n")
+        self.assertEqual(os.stat(self.dest).st_mtime, 1000000000)
+
+    def test_env_overrides_are_respected(self):
+        alt = os.path.join(self.t, "alt", "sk.conf")
+        self.assertEqual(self.seed(SESSION_KEEPER_CONFIG=alt, XDG_CONFIG_HOME=os.path.join(self.t, "x")).returncode, 0)
+        self.assertEqual(self.bytes(alt), self.bytes(self.STARTER))
+        self.assertFalse(os.path.exists(os.path.join(self.t, "x")))
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".config")))
+        xdg = os.path.join(self.t, "xdg")
+        self.assertEqual(self.seed(XDG_CONFIG_HOME=xdg).returncode, 0)
+        self.assertEqual(self.bytes(os.path.join(xdg, "session-keeper", "config")), self.bytes(self.STARTER))
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".config")))
+
+    def test_unwritable_place_does_not_crash(self):
+        with open(os.path.join(self.home, ".config"), "w") as f:   # a file where the folder should be
+            f.write("x")
+        r = self.seed()
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                     "read-only folders are not enforced for Windows or root")
+    def test_read_only_folder_does_not_crash(self):
+        cfgdir = os.path.join(self.home, ".config")
+        os.makedirs(cfgdir)
+        os.chmod(cfgdir, 0o500)
+        try:
+            r = self.seed()
+            self.assertEqual((r.returncode, r.stderr), (0, ""))
+            self.assertEqual(os.listdir(cfgdir), [])
+        finally:
+            os.chmod(cfgdir, 0o700)
+
+    def test_seeded_config_behaves_like_no_config(self):
+        """The starter sets nothing: the reader gets no setting from it, and every option listed in it still
+        resolves to its built-in default."""
+        self.assertEqual(sk_common._read_config(self.STARTER), {})
+        code = ("import json,sys; sys.path.insert(0, sys.argv[1]); import sk_common as s; "
+                "keys = sorted(l.split('=')[0].lstrip('# ').strip() for l in open(sys.argv[2]) "
+                "if l.startswith('# ') and '=' in l and l[2:].split('=')[0].isupper()); "
+                "print(json.dumps([s._CONFIG, {k: s.cfg(k, 'DEFAULT') for k in keys}, s.state_dir(), s.log_dir()]))")
+        outs = []
+        for seeded in (False, True):
+            if seeded:
+                self.assertEqual(self.seed().returncode, 0)
+                self.assertTrue(os.path.isfile(self.dest))
+            else:
+                self.assertFalse(os.path.exists(self.dest))
+            r = subprocess.run([sys.executable, "-c", code, os.path.join(ROOT, "lib"), self.STARTER],
+                               capture_output=True, text=True, env=self.env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            outs.append(json.loads(r.stdout))
+        self.assertEqual(outs[0], outs[1])
+        self.assertGreater(len(outs[0][1]), 30)   # every option of the starter was checked
+
+
 if __name__ == "__main__":
     try:
         unittest.main()

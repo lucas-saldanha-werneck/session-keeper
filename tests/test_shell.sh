@@ -210,6 +210,13 @@ done
 ok "all 7 commands linked"
 out2="$("$T/home/.local/bin/claude-save" --dry-run 2>&1)"
 has "installed claude-save runs from its symlink (finds lib/)" "dry-run: nothing saved" "$out2"
+SEEDED="$T/seeded/session-keeper/config"
+SESSION_KEEPER_CONFIG="$SEEDED" "$T/home/.local/bin/claude-save" --dry-run >/dev/null 2>&1
+cmp -s "$SEEDED" "$ROOT/config.example" && ok "installed claude-save seeds the config from its installed starter" \
+  || bad "installed claude-save seeds the config" "$(ls -la "$T/seeded/session-keeper" "$T/home/.local/share/session-keeper" 2>&1)"
+SHV="$(env -i HOME="$HOME" PATH="$PATH" bash -c '. "$1/lib/sk_config.sh"; before="$(export -p)"; sk_load_config "$2"
+[[ "$(export -p)" == "$before" ]] && echo same' _ "$ROOT" "$SEEDED")"
+[[ "$SHV" == same ]] && ok "the bash reader exports nothing from the seeded config" || bad "bash reader exported from the starter"
 out2="$("$T/home/.local/bin/claude-restart" --pending 2>&1)"; rc=$?
 [[ $rc -eq 0 ]] && hasnt "installed claude-restart finds lib/sk_config.sh through its symlink" "sk_config.sh" "$out2" \
   || bad "installed claude-restart runs from its symlink" "rc=$rc $out2"

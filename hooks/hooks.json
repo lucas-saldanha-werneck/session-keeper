@@ -2,6 +2,12 @@
   "hooks": {
     "SessionStart": [
       {
+        "matcher": "startup",
+        "hooks": [
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/lib/sk_common.py", "--seed"], "timeout": 10 }
+        ]
+      },
+      {
         "matcher": "startup|resume",
         "hooks": [
           { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/claude-save", "--warn"], "timeout": 5 }
