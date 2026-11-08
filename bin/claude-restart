@@ -28,21 +28,16 @@
 set -euo pipefail
 
 CONF="${SESSION_KEEPER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/session-keeper/config}"
-load_config() {  # KEY=VALUE lines; a variable already set in the environment wins
-  local line k v
-  [[ -f "$CONF" ]] || return 0
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line#"${line%%[![:space:]]*}"}"; line="${line#export }"
-    [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
-    k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
-    [[ -n "${!k:-}" ]] && continue
-    # strip one pair of surrounding quotes only (like the Python reader), so `cmd "two words"` stays intact
-    if [[ ${#v} -ge 2 && ( ( "${v:0:1}" == '"' && "${v: -1}" == '"' ) || ( "${v:0:1}" == "'" && "${v: -1}" == "'" ) ) ]]; then v="${v:1:${#v}-2}"; fi
-    v="${v/#\~/$HOME}"
-    printf -v "$k" '%s' "$v"; export "${k?}"
-  done < "$CONF"
-}
-load_config
+# config: KEY=VALUE lines read by lib/sk_config.sh (same rules as the Python commands). Follow the
+# ~/.local/bin symlink (at most 20 hops) to find our lib folder.
+_sk_self="${BASH_SOURCE[0]}"
+for _sk_i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  [[ -L "$_sk_self" ]] || break
+  _sk_t="$(readlink "$_sk_self")"
+  if [[ "$_sk_t" == /* ]]; then _sk_self="$_sk_t"; else _sk_self="$(dirname "$_sk_self")/$_sk_t"; fi
+done
+. "$(cd "$(dirname "$_sk_self")/.." && pwd)/lib/sk_config.sh"
+sk_load_config "$CONF"
 
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 PROJ_ROOT="$CLAUDE_DIR/projects"

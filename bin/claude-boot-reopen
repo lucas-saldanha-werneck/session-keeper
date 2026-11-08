@@ -3,24 +3,25 @@
 # Opens iTerm2 with one window that runs `claude-save --reopen`, which reopens the windows and Claude
 # Code sessions of the last save. Without iTerm2 it runs `claude-save --reopen` directly (sessions
 # come back as detached tmux sessions).
-# Afterwards, when SESSION_KEEPER_POST_BOOT is set, it waits SESSION_KEEPER_POST_BOOT_DELAY seconds
-# (default 0) and runs `claude-save --post-boot`: your command runs and what it prints goes to
-# SESSION_KEEPER_NOTIFY (e.g. a "the Mac restarted, N sessions back" message to your phone).
+# Afterwards, when SESSION_KEEPER_POST_BOOT is set: it waits for the reopen to finish (at most
+# SESSION_KEEPER_POST_BOOT_WAIT s, default 600), then SESSION_KEEPER_POST_BOOT_DELAY s more (default 0), and
+# runs `claude-save --post-boot`: your command runs with SESSION_KEEPER_REOPEN_RESULT (ok|failed|timeout),
+# SESSION_KEEPER_REOPEN_UP and SESSION_KEEPER_REOPEN_TOTAL in its environment, and what it prints goes to
+# SESSION_KEEPER_NOTIFY. If iTerm2 cannot be opened, nothing is reopened, the post-boot command is skipped
+# and SESSION_KEEPER_NOTIFY gets a message instead.
 # Test without opening anything: claude-boot-reopen --dry-run
 set -u
 CONF="${SESSION_KEEPER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/session-keeper/config}"
-if [[ -f "$CONF" ]]; then  # KEY=VALUE lines; a variable already set in the environment wins
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line#"${line%%[![:space:]]*}"}"; line="${line#export }"
-    [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
-    k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
-    [[ -n "${!k:-}" ]] && continue
-    # strip one pair of surrounding quotes only (like the Python reader), so `cmd "two words"` stays intact
-    if [[ ${#v} -ge 2 && ( ( "${v:0:1}" == '"' && "${v: -1}" == '"' ) || ( "${v:0:1}" == "'" && "${v: -1}" == "'" ) ) ]]; then v="${v:1:${#v}-2}"; fi
-    v="${v/#\~/$HOME}"
-    printf -v "$k" '%s' "$v"; export "${k?}"
-  done < "$CONF"
-fi
+# config: KEY=VALUE lines read by lib/sk_config.sh (same rules as the Python commands). Follow the
+# ~/.local/bin symlink (at most 20 hops) to find our lib folder.
+_sk_self="${BASH_SOURCE[0]}"
+for _sk_i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  [[ -L "$_sk_self" ]] || break
+  _sk_t="$(readlink "$_sk_self")"
+  if [[ "$_sk_t" == /* ]]; then _sk_self="$_sk_t"; else _sk_self="$(dirname "$_sk_self")/$_sk_t"; fi
+done
+. "$(cd "$(dirname "$_sk_self")/.." && pwd)/lib/sk_config.sh"
+sk_load_config "$CONF"
 BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="$BIN_DIR:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 if [[ "$(uname -s)" == Darwin ]]; then LOGDIR="${SESSION_KEEPER_LOG_DIR:-$HOME/Library/Logs}"
@@ -34,20 +35,43 @@ DRY=0; [[ "${1:-}" == "--dry-run" ]] && DRY=1
 ARG="--reopen"; (( DRY )) && ARG="--reopen --dry-run"
 echo "$(date '+%F %T') start ($ARG)" >>"$LOG"
 
-post_boot() {
+RES="$ST/reopen.result"; OUT="$ST/reopen.out"
+rm -f "$RES" "$RES.tmp" "$OUT"
+
+reopen_result() {  # sets RESULT (ok|failed|timeout), UP and TOTAL from the files the reopen left
+  local rc line
+  RESULT=timeout; UP=""; TOTAL=""
+  if [[ -f "$RES" ]]; then
+    rc="$(tr -dc '0-9' <"$RES")"
+    if [[ "${rc:-1}" == 0 ]]; then RESULT=ok; else RESULT=failed; fi
+  fi
+  line="$(grep -E '^done: [0-9]+ of [0-9]+ ' "$OUT" 2>/dev/null | tail -1)"
+  if [[ "$line" =~ ^done:\ ([0-9]+)\ of\ ([0-9]+) ]]; then UP="${BASH_REMATCH[1]}"; TOTAL="${BASH_REMATCH[2]}"; fi
+}
+
+post_boot() {  # after the reopen finished: SESSION_KEEPER_POST_BOOT gets the result in its environment
   [[ -n "${SESSION_KEEPER_POST_BOOT:-}" ]] || return 0
   if (( DRY )); then echo "$(date '+%F %T') dry-run: would run the post-boot command: $SESSION_KEEPER_POST_BOOT" >>"$LOG"; return 0; fi
-  sleep "${SESSION_KEEPER_POST_BOOT_DELAY:-0}"
+  local wait="${SESSION_KEEPER_POST_BOOT_WAIT:-600}" delay="${SESSION_KEEPER_POST_BOOT_DELAY:-0}" i=0 rc=0
+  [[ "$wait" =~ ^[0-9]+$ ]] || wait=600
+  [[ "$delay" =~ ^[0-9]+$ ]] || delay=0
+  while [[ ! -f "$RES" && $i -lt $wait ]]; do sleep 2; i=$((i + 2)); done   # the reopen runs in its own window
+  reopen_result
+  export SESSION_KEEPER_REOPEN_RESULT="$RESULT" SESSION_KEEPER_REOPEN_UP="$UP" SESSION_KEEPER_REOPEN_TOTAL="$TOTAL"
+  echo "$(date '+%F %T') reopen result: $RESULT (${UP:-?} of ${TOTAL:-?} up); post-boot in ${delay} s" >>"$LOG"
+  sleep "$delay"
   echo "$(date '+%F %T') post-boot: $SESSION_KEEPER_POST_BOOT" >>"$LOG"
-  local rc=0
   "$BIN_DIR/claude-save" --post-boot >>"$LOG" 2>&1 || rc=$?
   echo "$(date '+%F %T') post-boot finished (exit $rc)" >>"$LOG"
 }
 
 if [[ "$(uname -s)" != Darwin || ! -d "$ITERM_APP" ]]; then
   echo "$(date '+%F %T') no iTerm2: running claude-save $ARG directly" >>"$LOG"
+  rc=0
   # shellcheck disable=SC2086
-  "$BIN_DIR/claude-save" $ARG >>"$LOG" 2>&1
+  "$BIN_DIR/claude-save" $ARG >"$OUT" 2>&1 || rc=$?
+  cat "$OUT" >>"$LOG"
+  echo "$rc" >"$RES"
   post_boot
   exit 0
 fi
@@ -57,17 +81,24 @@ CMD="$ST/reopen.command"
 cat >"$CMD" <<EOF
 #!$SH -l
 echo "claude-boot-reopen: claude-save $ARG"
-"$BIN_DIR/claude-save" $ARG 2>&1 | tee -a "$LOG"
+{ "$BIN_DIR/claude-save" $ARG; echo \$? >"$RES.tmp"; } 2>&1 | tee -a "$LOG" "$OUT"
+mv -f "$RES.tmp" "$RES"
 echo "\$(date '+%F %T') reopen finished" >>"$LOG"
 exec $SH -l
 EOF
 chmod +x "$CMD"
 # `open -a iTerm x.command` does not run the script; osascript from launchd does.
+opened=0
 for t in 1 2 3 4 5 6; do
   if osascript -e "tell application \"iTerm\" to create window with default profile command \"$SH -l $CMD\"" >>"$LOG" 2>&1; then
-    echo "$(date '+%F %T') iTerm opened with $CMD (attempt $t)" >>"$LOG"; break
+    echo "$(date '+%F %T') iTerm opened with $CMD (attempt $t)" >>"$LOG"; opened=1; break
   fi
   echo "$(date '+%F %T') osascript failed (attempt $t), retrying in 10 s" >>"$LOG"
-  (( DRY )) || sleep 10
+  (( DRY )) || sleep "${CLAUDE_BOOT_RETRY_DELAY:-10}"
 done
+if (( ! opened )); then  # nothing was reopened, so no post-boot; say so instead
+  echo "$(date '+%F %T') could not open iTerm: nothing reopened, post-boot skipped" >>"$LOG"
+  (( DRY )) || "$BIN_DIR/claude-save" --notify "claude-boot-reopen: could not open iTerm after login, nothing was reopened. Run claude-save --reopen yourself. Log: $LOG" >>"$LOG" 2>&1
+  exit 1
+fi
 post_boot

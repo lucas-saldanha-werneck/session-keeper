@@ -16,6 +16,7 @@ Usage:
   claude-save --reopen --file X      use another save file
   claude-save --post-boot            run $SESSION_KEEPER_POST_BOOT and send what it prints to
                                      $SESSION_KEEPER_NOTIFY (claude-boot-reopen calls this after login)
+  claude-save --notify TEXT          send TEXT through $SESSION_KEEPER_NOTIFY
 
 Your own commands (settings, see the README):
   SESSION_KEEPER_PRE_SAVE     runs before a manual save; a failure is shown, the save goes on
@@ -127,19 +128,42 @@ def my_ancestors():
     return out
 
 
-def claude_cmd(cwd, sid, d, remote=None):
-    """Command that resumes conversation sid in cwd, carrying the env vars and --remote-control the
-    original process had."""
-    env = []
+def resume_spec(cwd, sid, d, remote=None):
+    """What a resume needs, kept in the save so --reopen can rebuild the command: folder, id, the
+    SESSION_KEEPER_KEEP_ENV variables and --remote-control of the original process."""
+    env = {}
     if d and d.get("pid"):
-        env = [f"{k}={shlex.quote(v)}" for k, v in proc_env(d["pid"]).items()]
+        env = proc_env(d["pid"])
         if remote is None:
             remote = "--remote-control" in proc_args(d["pid"])
-    args = ["claude", "--resume", sid]
+    return {"cwd": cwd, "sid": sid, "env": env, "remote": bool(remote)}
+
+
+def build_cmd(spec, extra_env=()):
+    """`cd <cwd> && [saved env] [extra_env] claude --resume <id> ...`. extra_env (KEY, VALUE) pairs come
+    last, so they win over a saved variable of the same name."""
+    env = [f"{k}={shlex.quote(v)}" for k, v in spec.get("env", {}).items()]
+    env += [f"{k}={shlex.quote(v)}" for k, v in extra_env]
+    args = ["claude", "--resume", spec["sid"]]
     extra = cfg("SESSION_KEEPER_CLAUDE_ARGS")
-    if remote and "--remote-control" not in extra:
+    if spec.get("remote") and "--remote-control" not in extra:
         args.append("--remote-control")
-    return f"cd {shlex.quote(cwd)} && " + " ".join(env + args) + (f" {extra}" if extra else "")
+    return f"cd {shlex.quote(spec['cwd'])} && " + " ".join(env + args) + (f" {extra}" if extra else "")
+
+
+def claude_cmd(cwd, sid, d, remote=None, extra_env=()):
+    """Command that resumes conversation sid in cwd, carrying the env vars and --remote-control the
+    original process had."""
+    return build_cmd(resume_spec(cwd, sid, d, remote), extra_env)
+
+
+def env_assignments(text):
+    """(KEY, VALUE) pairs from a KEY=VALUE ... setting (shell quoting allowed; anything else is ignored)."""
+    try:
+        words = shlex.split(text or "")
+    except ValueError:
+        return []
+    return [tuple(w.split("=", 1)) for w in words if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)]
 
 
 def typed_cmd(cwd, command):
@@ -274,23 +298,15 @@ def auto_may_save():
 
 
 def preflight(name, what):
-    """Run a user command from the settings before a save or a restore. True = fine or not set."""
+    """Run a user command from the settings before a save or a restore. Returns None when it passed or is
+    not set, else the warning line (already printed)."""
     r = run_configured(name, log)
     if r is None or r.returncode == 0:
-        return True
+        return None
     detail = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
-    print(f"warning: {name} failed (exit {r.returncode}) before {what}" + (f": {detail[-1]}" if detail else ""))
-    return False
-
-
-def with_env(cmd, assignments):
-    """Put KEY=VALUE assignments in front of the claude command of a resume line ("cd X && ... claude")."""
-    pairs = [a for a in shlex.split(assignments) if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", a)]
-    if not pairs or " && " not in cmd:
-        return cmd
-    head, tail = cmd.split(" && ", 1)
-    return f"{head} && " + " ".join(shlex.quote(p.split("=", 1)[0]) + "=" + shlex.quote(p.split("=", 1)[1])
-                                     for p in pairs) + " " + tail
+    msg = f"warning: {name} failed (exit {r.returncode}) before {what}" + (f": {detail[-1]}" if detail else "")
+    print(msg)
+    return msg
 
 
 def post_boot():
@@ -323,7 +339,8 @@ def save(dry, auto=False):
         if sid:
             d = live.get(sid)
             j["cwd"] = j.get("claude_cwd") or j.get("cwd") or HOME
-            j["cmd"] = claude_cmd(j["cwd"], sid, d, remote=j.get("remote"))
+            j["resume"] = resume_spec(j["cwd"], sid, d, remote=j.get("remote"))
+            j["cmd"] = build_cmd(j["resume"])
             j["status"] = (d or {}).get("status")
             j["pid"] = (d or {}).get("pid")
         else:
@@ -346,9 +363,9 @@ def save(dry, auto=False):
         d = claude_of_tmux_session(name, live)
         if d:
             cwd = d.get("cwd") or HOME
+            spec = resume_spec(cwd, d["sessionId"], d)
             detached.append({"session": name, "cwd": cwd, "claude_id": d["sessionId"], "name": d.get("name"),
-                             "status": d.get("status"), "pid": d["pid"],
-                             "cmd": claude_cmd(cwd, d["sessionId"], d)})
+                             "status": d.get("status"), "pid": d["pid"], "resume": spec, "cmd": build_cmd(spec)})
             continue
         panes = panes_of(name)
         com = next((c for c in (pane_command(p) for p, _ in panes) if c), None)
@@ -532,9 +549,17 @@ def reopen(path, dry, force, newest=None):
         else:
             # By default a window-less session comes back in its own window, cascaded (after a reboot
             # you are at the Mac). --no-window = it comes back as a detached tmux session, as it was.
-            cmd = strip_presence(s["cmd"]) if s.get("claude_id") else typed_cmd(s["cwd"], s.get("command"))
+            extra = {}
+            if s.get("claude_id") and s.get("resume"):  # got a window: the presence variable is not needed
+                spec = dict(s["resume"], env={k: v for k, v in s["resume"].get("env", {}).items() if k != PRESENCE_VAR})
+                extra = {"resume": spec}
+                cmd = build_cmd(spec)
+            elif s.get("claude_id"):  # save from before 0.2.0: only the command string is there
+                cmd = strip_presence(s["cmd"])
+            else:
+                cmd = typed_cmd(s["cwd"], s.get("command"))
             dx = 40 * (i + 1)
-            windows.append({**s, "window": f"detached-{i}", "tab": 1, "tty": "", "kind": "detached",
+            windows.append({**s, **extra, "window": f"detached-{i}", "tab": 1, "tty": "", "kind": "detached",
                             "bounds": [60 + dx, 30 + dx, 900 + dx, 830 + dx], "cmd": cmd})
     if detached and not cir.HAS_TMUX:
         manual, detached = detached, []
@@ -551,13 +576,22 @@ def reopen(path, dry, force, newest=None):
     if dry:
         print("(dry-run: nothing opened)")
         return 0
-    if not preflight("SESSION_KEEPER_PRE_REOPEN", "reopening"):
-        fail_env = cfg("SESSION_KEEPER_PRE_REOPEN_FAIL_ENV")
+    pre_warning = preflight("SESSION_KEEPER_PRE_REOPEN", "reopening")
+    if pre_warning:
+        fail_env = env_assignments(cfg("SESSION_KEEPER_PRE_REOPEN_FAIL_ENV"))
+        old = 0
+        for x in windows + detached:
+            if x.get("claude_id") and fail_env:
+                if x.get("resume"):
+                    x["cmd"] = build_cmd(x["resume"], fail_env)
+                else:
+                    old += 1
         if fail_env:
-            print(f"  resumed sessions get: {fail_env}")
-            for x in windows + detached:
-                if x.get("claude_id") and x.get("cmd"):
-                    x["cmd"] = with_env(x["cmd"], fail_env)
+            pre_warning += "; resumed sessions get " + " ".join(f"{k}={v}" for k, v in fail_env)
+            print("  resumed sessions get: " + " ".join(f"{k}={shlex.quote(v)}" for k, v in fail_env))
+        if old:
+            pre_warning += f" (not {old} session(s) from a save made before session-keeper 0.2.0)"
+            print(f"  ({old} session(s) come from a save made before session-keeper 0.2.0 and are resumed unchanged)")
     log(f"reopen: save from {data['when']}: {len(windows)} window(s), {len(detached)} detached")
 
     for s in detached:
@@ -598,8 +632,9 @@ def reopen(path, dry, force, newest=None):
     print(f"done: {len(waiting) - len(missing)} of {len(waiting)} conversation(s) up" +
           (f"; not up yet: {[i[:8] for i in missing]} (see the log)" if missing else ""))
     log(f"reopen: end; {len(waiting) - len(missing)}/{len(waiting)} conversations alive; missing {[i[:8] for i in missing]}")
-    if problems or error:
+    if problems or error or pre_warning:
         notify(f"claude-save --reopen: {len(waiting) - len(missing)} of {len(waiting)} conversation(s) came back."
+               + (f"\n{pre_warning}" if pre_warning else "")
                + "".join(f"\n- {p}" for p in problems)
                + (f"\nError while opening windows: {error}" if error else "")
                + ("" if marked else "\nNothing was marked as restored: run claude-save --reopen again."), log)
@@ -630,6 +665,8 @@ def main():
             with open(SAVE) as f:
                 newest = json.load(f)
         return reopen(path, "--dry-run" in a, "--force" in a, newest)
+    if a[:1] == ["--notify"] and len(a) == 2:  # used by claude-boot-reopen
+        return 0 if notify(a[1], log) else 1
     if a == ["--post-boot"]:
         try:
             return post_boot()

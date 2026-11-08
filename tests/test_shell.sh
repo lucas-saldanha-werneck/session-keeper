@@ -138,6 +138,65 @@ SESSION_KEEPER_CONFIG="$T/sk-config" "$ROOT/bin/claude-boot-reopen"
 rm -f "$UB/notifier" "$UB/boot-report"
 has "a failing post-boot command is logged with its exit code" "post-boot finished (exit 1)" "$(cat "$BLOG")"
 
+echo "== claude-boot-reopen: post-boot only after the reopen, with its result (review #2)"
+UB="$T/home/.local/bin"; mkdir -p "$UB"; L2="$T/blogs"; B2="$L2/claude-boot-reopen.log"
+printf '#!/bin/bash\necho "$*" >>"$FAKE_DIR/notified"\n' >"$UB/notifier"
+printf '#!/bin/bash\necho "result=$SESSION_KEEPER_REOPEN_RESULT up=$SESSION_KEEPER_REOPEN_UP total=$SESSION_KEEPER_REOPEN_TOTAL"\n' >"$UB/boot-report"
+printf '#!/bin/bash\necho Darwin\n' >"$UB/uname"
+# fake osascript that, like iTerm, runs the reopen.command in the background
+printf '#!/bin/bash\nc="$(sed -n "s/.* -l \\(.*\\)\\"$/\\1/p" <<<"$2")"\n[ -n "$c" ] && (bash "$c" </dev/null >/dev/null 2>&1 &)\nexit 0\n' >"$UB/osascript"
+chmod +x "$UB"/*
+mkdir -p "$T/iTerm.app"
+printf 'SESSION_KEEPER_POST_BOOT=boot-report\nSESSION_KEEPER_NOTIFY=notifier\n' >"$T/sk-config2"
+: >"$T/notified"
+SHELL=/bin/bash SESSION_KEEPER_CONFIG="$T/sk-config2" SESSION_KEEPER_ITERM_APP="$T/iTerm.app" SESSION_KEEPER_LOG_DIR="$L2" \
+  CLAUDE_BOOT_REOPEN_DELAY=0 SESSION_KEEPER_POST_BOOT_WAIT=30 "$ROOT/bin/claude-boot-reopen"
+has "iTerm path: waits for the reopen window, then passes its result" "result=failed up= total=" "$(cat "$T/notified")"
+has "the result is logged before the post-boot command" "reopen result: failed" "$(cat "$B2")"
+o="$(grep -n 'reopen result' "$B2" | head -1 | cut -d: -f1)"; f="$(grep -n 'post-boot finished' "$B2" | head -1 | cut -d: -f1)"
+[[ -n "$o" && -n "$f" && "$o" -lt "$f" ]] && ok "post-boot runs after the reopen finished" || bad "post-boot order" "$(cat "$B2")"
+
+: >"$T/notified"; : >"$B2"
+printf '#!/bin/bash\nexit 1\n' >"$UB/osascript"; chmod +x "$UB/osascript"
+SHELL=/bin/bash SESSION_KEEPER_CONFIG="$T/sk-config2" SESSION_KEEPER_ITERM_APP="$T/iTerm.app" SESSION_KEEPER_LOG_DIR="$L2" \
+  CLAUDE_BOOT_REOPEN_DELAY=0 CLAUDE_BOOT_RETRY_DELAY=0 SESSION_KEEPER_POST_BOOT_WAIT=2 "$ROOT/bin/claude-boot-reopen"; rc=$?
+[[ $rc -eq 1 ]] && ok "iTerm could not be opened: exit 1" || bad "iTerm could not be opened: exit 1" "rc=$rc"
+hasnt "and the post-boot command is skipped" "result=" "$(cat "$T/notified")"
+has "the failure goes to the notifier instead" "could not open iTerm after login" "$(cat "$T/notified")"
+rm -f "$UB/uname" "$UB/osascript" "$UB/notifier" "$UB/boot-report"
+
+echo "== config readers agree (review #3, #4, #6, #10)"
+cat >"$T/parity.conf" <<'PARITY'
+# comment
+P_PLAIN=plain value
+P_SQ='single quoted $HOME'
+P_DQ="double quoted"
+P_INNER=cmd "two words" 'and $X'
+P_TILDE=~/x
+P_TILDE_ONLY=~
+P_TILDE_USER=~root/x
+P_HOME=$HOME/bin/push --url https://example.com//a
+P_HOME_BRACES=${HOME}
+P_HOMEX=$HOMEX/y
+P_VAR=$USER and ${PATH}
+  export P_EXPORT = spaced
+P_EMPTY=
+P_EQ=a=b=c
+NOT A KEY=1
+P_CRLF=windows
+PARITY
+printf 'P_CR=x\r\n' >>"$T/parity.conf"
+keys="P_PLAIN P_SQ P_DQ P_INNER P_TILDE P_TILDE_ONLY P_TILDE_USER P_HOME P_HOME_BRACES P_HOMEX P_VAR P_EXPORT P_EMPTY P_EQ P_CRLF P_CR"
+PYV="$(cd "$ROOT" && python3 -c 'import sys; sys.path.insert(0, "lib"); import sk_common as c
+d = c._read_config(sys.argv[1])
+for k in sys.argv[2].split(): print(k + "=" + d.get(k, "<unset>"))' "$T/parity.conf" "$keys")"
+SHV="$(env -i HOME="$HOME" PATH="$PATH" bash -c '. "$1/lib/sk_config.sh"; sk_load_config "$2"
+for k in $3; do if [[ -n "${!k+x}" ]]; then printf "%s=%s\n" "$k" "${!k}"; else printf "%s=<unset>\n" "$k"; fi; done' _ "$ROOT" "$T/parity.conf" "$keys")"
+if [[ "$PYV" == "$SHV" ]]; then ok "Python and bash readers give the same values"; else bad "readers differ" "$(diff <(echo "$PYV") <(echo "$SHV"))"; fi
+has "single-quoted \$HOME is not expanded" "P_SQ=single quoted \$HOME" "$SHV"
+has "a URL inside a command keeps its //" "P_HOME=$HOME/bin/push --url https://example.com//a" "$SHV"
+has "other variables are not expanded" 'P_VAR=$USER and ${PATH}' "$SHV"
+
 echo "== install.sh"
 : >"$T/calls"
 out="$(SESSION_KEEPER_INSTALL_OS=Darwin "$ROOT/install.sh" --dry-run 2>&1)"
@@ -151,6 +210,9 @@ done
 ok "all 7 commands linked"
 out2="$("$T/home/.local/bin/claude-save" --dry-run 2>&1)"
 has "installed claude-save runs from its symlink (finds lib/)" "dry-run: nothing saved" "$out2"
+out2="$("$T/home/.local/bin/claude-restart" --pending 2>&1)"; rc=$?
+[[ $rc -eq 0 ]] && hasnt "installed claude-restart finds lib/sk_config.sh through its symlink" "sk_config.sh" "$out2" \
+  || bad "installed claude-restart runs from its symlink" "rc=$rc $out2"
 A="$T/home/Library/LaunchAgents"
 for l in autosave tmux-gc boot-reopen; do
   f="$A/org.example.sk.$l.plist"

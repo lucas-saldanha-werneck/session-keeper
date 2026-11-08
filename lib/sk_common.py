@@ -15,7 +15,23 @@ CONFIG_FILE = os.environ.get("SESSION_KEEPER_CONFIG") or os.path.join(
     os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "session-keeper", "config")
 
 
+# Settings that hold one path: their slashes are normalized (Windows: "C:\\Users\\me/x" -> "C:\\Users\\me\\x").
+# Never applied to other settings: a command line or a URL must reach its program as written.
+PATH_KEYS = {"SESSION_KEEPER_STATE_DIR", "SESSION_KEEPER_LOG_DIR", "SESSION_KEEPER_TMUX", "SESSION_KEEPER_SHELL",
+             "SESSION_KEEPER_ITERM_APP", "CLAUDE_AUTO_RETRY_LAUNCHER"}
+
+
+def _expand_home(v):
+    """Only a leading ~ or $HOME / ${HOME} (alone or followed by /) becomes the home folder; nothing else is
+    expanded. lib/sk_config.sh follows the same rule."""
+    for prefix in ("~", "$HOME", "${HOME}"):
+        if v == prefix or v.startswith(prefix + "/"):
+            return HOME + v[len(prefix):]
+    return v
+
+
 def _read_config(path):
+    """KEY=VALUE lines, shell style. Same rules as sk_load_config in lib/sk_config.sh."""
     out = {}
     try:
         with open(path) as f:
@@ -30,9 +46,9 @@ def _read_config(path):
                 v = v.strip()
                 if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
                     v = v[1:-1]
-                v = os.path.expandvars(os.path.expanduser(v))
-                if v.startswith(HOME):
-                    v = os.path.normpath(v)  # Windows: "C:\\Users\\me/x" -> "C:\\Users\\me\\x"
+                v = _expand_home(v)
+                if k in PATH_KEYS and v:
+                    v = os.path.normpath(v)
                 out[k] = v
     except OSError:
         pass
@@ -44,10 +60,20 @@ _CONFIG = _read_config(CONFIG_FILE)
 
 def cfg(name, default=""):
     """Setting from the environment, else the config file, else default."""
-    v = os.environ.get(name)
-    if v is None:
-        v = _CONFIG.get(name)
+    v = os.environ.get(name) or _CONFIG.get(name)  # a non-empty environment variable wins, as in sk_config.sh
     return default if v is None or v == "" else v
+
+
+def cfg_number(name, default):
+    """A numeric setting; a value that is not a number falls back to `default` with a warning on stderr."""
+    raw = cfg(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"warning: {name}={raw!r} is not a number; using {default:g}", file=sys.stderr)
+        return default
 
 
 def claude_dir():
@@ -119,7 +145,7 @@ def run_configured(name, log=None):
     if not cmd:
         return None
     import shlex
-    timeout = float(cfg("SESSION_KEEPER_HOOK_TIMEOUT", "30"))
+    timeout = cfg_number("SESSION_KEEPER_HOOK_TIMEOUT", 30.0)
     try:
         r = run(shlex.split(cmd), timeout=timeout)
     except subprocess.TimeoutExpired:

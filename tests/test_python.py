@@ -8,6 +8,7 @@ lives in a temporary folder. Runs on macOS, Linux and Windows. Run: python3 test
 import importlib.util
 import io
 import json
+import shlex
 import os
 import shutil
 import subprocess
@@ -260,7 +261,7 @@ class TestConfig(unittest.TestCase):
         with open(p, "w") as f:
             f.write("# comment\nexport A_ONE='~/x'\nB_TWO=\"two\"\nNOT A LINE\nSESSION_KEEPER_GC_PREFIX=file\n")
         c = sk_common._read_config(p)
-        self.assertEqual(c["A_ONE"], os.path.join(HOME, "x"))
+        self.assertEqual(c["A_ONE"], HOME + "/x")
         self.assertEqual(c["B_TWO"], "two")
         self.assertNotIn("NOT A LINE", c)
         with mock.patch.dict(sk_common._CONFIG, c), mock.patch.dict(os.environ, {"SESSION_KEEPER_GC_PREFIX": "env"}):
@@ -268,6 +269,27 @@ class TestConfig(unittest.TestCase):
         with mock.patch.dict(sk_common._CONFIG, c):
             self.assertEqual(sk_common.cfg("SESSION_KEEPER_GC_PREFIX"), "file")
             self.assertEqual(sk_common.cfg("MISSING_X", "dflt"), "dflt")
+
+    def test_commands_reach_their_program_as_written(self):
+        # review #3 and #4: no $VAR expansion inside a command, no normpath of non-path settings
+        p = os.path.join(TMP, "cfg-cmd")
+        with open(p, "w") as f:
+            f.write("SESSION_KEEPER_PRE_REOPEN=sh -c 'echo $HOME $USER'\n"
+                    "SESSION_KEEPER_NOTIFY=$HOME/bin/push --url https://example.com//x\n"
+                    "SESSION_KEEPER_STATE_DIR=~/state//sub/\n"
+                    "OTHER=${HOME}\nNOT_HOME=$HOMEX/y\nTILDE_USER=~root/x\n")
+        c = sk_common._read_config(p)
+        self.assertEqual(c["SESSION_KEEPER_PRE_REOPEN"], "sh -c 'echo $HOME $USER'")
+        self.assertEqual(c["SESSION_KEEPER_NOTIFY"], HOME + "/bin/push --url https://example.com//x")
+        self.assertEqual(c["SESSION_KEEPER_STATE_DIR"], os.path.normpath(HOME + "/state//sub/"))
+        self.assertEqual(c["OTHER"], HOME)
+        self.assertEqual(c["NOT_HOME"], "$HOMEX/y")
+        self.assertEqual(c["TILDE_USER"], "~root/x")
+
+    def test_empty_env_var_does_not_hide_the_file(self):
+        with mock.patch.dict(sk_common._CONFIG, {"SESSION_KEEPER_GC_PREFIX": "file"}), \
+                mock.patch.dict(os.environ, {"SESSION_KEEPER_GC_PREFIX": ""}):
+            self.assertEqual(sk_common.cfg("SESSION_KEEPER_GC_PREFIX"), "file")
 
     def test_run_missing_program_returns_127(self):
         r = sk_common.run(["definitely-not-a-program-sk"])
@@ -511,7 +533,7 @@ class TestUserCommands(Base):
         claude = [c for c in self.fs.created if "claude --resume" in c]
         self.assertEqual(len(claude), 3)
         for c in claude:
-            self.assertIn("&& NO_SECRETS=1 NOTE='a b' ", c)
+            self.assertIn(" NO_SECRETS=1 NOTE='a b' claude --resume ", c)
         self.assertFalse([c for c in self.fs.created if "claude --resume" not in c and "NO_SECRETS" in c])
 
     def test_pre_reopen_not_run_on_dry_run(self):
@@ -520,9 +542,56 @@ class TestUserCommands(Base):
         self.out(save_mod.reopen, save_mod.SAVE, True, False, argv=["--reopen", "--dry-run"])
         self.assertEqual(self.user_calls(), [])
 
-    def test_with_env_ignores_junk(self):
-        self.assertEqual(save_mod.with_env("cd /x && claude", "not-an-assignment"), "cd /x && claude")
-        self.assertEqual(save_mod.with_env("claude", "A=1"), "claude")
+    def test_env_assignments_ignores_junk(self):
+        self.assertEqual(save_mod.env_assignments("not-an-assignment A=1 'B=x y'"), [("A", "1"), ("B", "x y")])
+        self.assertEqual(save_mod.env_assignments("'unbalanced"), [])
+
+    def test_fail_env_with_and_in_folder_name(self):
+        # review #5: the env used to be inserted at the first " && ", which can be inside the quoted folder
+        self.make_save()
+        d = self.saved()
+        weird = os.path.join(HOME, "a && b")
+        for w in d["windows"]:
+            if w.get("claude_id") == SID_B:
+                w["resume"]["cwd"] = weird
+        with open(save_mod.SAVE, "w") as f:
+            json.dump(d, f)
+        os.environ["SESSION_KEEPER_PRE_REOPEN"] = "user-cmd 1 locked"
+        os.environ["SESSION_KEEPER_PRE_REOPEN_FAIL_ENV"] = "NO_SECRETS=1"
+        self.out(save_mod.reopen, save_mod.SAVE, False, False, argv=["--reopen", "--keep-window"])
+        c = [c for c in self.fs.created if SID_B in c][0]
+        self.assertIn(f"cd {shlex.quote(weird)} && NO_SECRETS=1 claude --resume {SID_B}", c)
+
+    def test_fail_env_comes_after_kept_env(self):
+        # review #8: a kept variable of the same name must not win over the fail env
+        self.make_save()
+        os.environ["SESSION_KEEPER_PRE_REOPEN"] = "user-cmd 1 locked"
+        os.environ["SESSION_KEEPER_PRE_REOPEN_FAIL_ENV"] = "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0"
+        self.out(save_mod.reopen, save_mod.SAVE, False, False, argv=["--reopen", "--keep-window"])
+        c = [c for c in self.fs.created if SID_A in c][0]
+        self.assertIn("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0 claude", c)
+
+    def test_pre_reopen_failure_is_notified(self):
+        # review #7: the reopen window closes, so the warning must also reach the notifier
+        self.make_save()
+        os.environ["SESSION_KEEPER_PRE_REOPEN"] = "user-cmd 1 vault locked"
+        os.environ["SESSION_KEEPER_NOTIFY"] = "notifier"
+        rc, out = self.out(save_mod.reopen, save_mod.SAVE, False, False, argv=["--reopen", "--keep-window"])
+        self.assertIn("done: 3 of 3", out)
+        sent = [c for c in self.fs.calls if c[0] == "notifier"]
+        self.assertEqual(len(sent), 1)
+        self.assertIn("SESSION_KEEPER_PRE_REOPEN failed (exit 1) before reopening: vault locked", sent[0][1])
+
+    def test_bad_hook_timeout_does_not_crash(self):
+        # review #1: float() on a bad value used to raise inside save/reopen
+        self.world()
+        os.environ["SESSION_KEEPER_PRE_SAVE"] = "user-cmd 0 fine"
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"SESSION_KEEPER_HOOK_TIMEOUT": "ten"}), mock.patch("sys.stderr", err):
+            rc, out = self.out(save_mod.save, False)
+        self.assertEqual(rc, 0)
+        self.assertIn("SESSION_KEEPER_HOOK_TIMEOUT='ten' is not a number; using 30", err.getvalue())
+        self.assertTrue(os.path.exists(save_mod.SAVE))
 
     def test_post_boot_sends_output_to_notifier(self):
         os.environ["SESSION_KEEPER_POST_BOOT"] = "user-cmd 0 Mac restarted, 3 sessions"

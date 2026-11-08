@@ -126,13 +126,20 @@ from your shell and from launchd, so everything they read is in this file or the
 | `SESSION_KEEPER_PRE_SAVE` | empty | A command run before a manual `claude-save` (not `--auto`, not `--dry-run`). If it fails, a warning with its last output line is shown; the save still happens |
 | `SESSION_KEEPER_PRE_REOPEN` | empty | A command run before `--reopen` opens anything, e.g. a check that your secrets manager is unlocked. If it fails, a warning is shown and the reopen goes on |
 | `SESSION_KEEPER_PRE_REOPEN_FAIL_ENV` | empty | `KEY=VALUE` pairs put in front of every resumed `claude` command when `SESSION_KEEPER_PRE_REOPEN` failed (e.g. a flag that tells your shell wrapper not to wait for secrets) |
-| `SESSION_KEEPER_POST_BOOT` | empty | A command `claude-boot-reopen` runs after it started the reopen (through `claude-save --post-boot`). Whatever it prints is sent to `SESSION_KEEPER_NOTIFY`, so it can report on the reboot |
-| `SESSION_KEEPER_POST_BOOT_DELAY` | `0` | Seconds `claude-boot-reopen` waits before the post-boot command, so the sessions have time to come up |
-| `SESSION_KEEPER_HOOK_TIMEOUT` | `30` | Seconds each of the three commands above may take; a timeout counts as a failure |
+| `SESSION_KEEPER_POST_BOOT` | empty | A command `claude-boot-reopen` runs once the reopen has finished (through `claude-save --post-boot`). It gets `SESSION_KEEPER_REOPEN_RESULT` (`ok`, `failed` or `timeout`), `SESSION_KEEPER_REOPEN_UP` and `SESSION_KEEPER_REOPEN_TOTAL` (conversations back / expected) in its environment, and whatever it prints is sent to `SESSION_KEEPER_NOTIFY`. If iTerm2 cannot be opened at all, nothing is reopened, the command is skipped and the notifier gets a message instead |
+| `SESSION_KEEPER_POST_BOOT_WAIT` | `600` | Longest wait, in seconds, for the reopen to finish before the post-boot command runs anyway (with `timeout`) |
+| `SESSION_KEEPER_POST_BOOT_DELAY` | `0` | Extra seconds after the reopen finished, before the post-boot command |
+| `SESSION_KEEPER_HOOK_TIMEOUT` | `30` | Seconds each of the three commands above may take; a timeout counts as a failure. A value that is not a number is ignored with a warning |
 | `SESSION_KEEPER_DROP_ENV` | empty | Extra environment variables (space-separated) not passed to an iTerm2 that session-keeper launches, so new shells start clean (e.g. a "secrets already loaded" flag) |
 
+How the file is read (the Python and the bash commands share these rules): one pair of quotes around the
+whole value is removed; a leading `~`, `~/`, `$HOME` or `${HOME}` becomes your home folder; nothing else is
+expanded, so `sh -c 'echo $X'` reaches `sh` exactly as written. A variable that is set (non-empty) in the
+environment wins over the file.
+
 The command settings are split like a shell line (quotes work; pipes and `&&` do not, wrap those in
-`sh -c '...'`). launchd jobs run with a short `PATH` (`~/.local/bin`, Homebrew, system folders), so
+`sh -c '...'`). When `SESSION_KEEPER_PRE_REOPEN` fails, the reopen goes on and the warning is also sent to
+`SESSION_KEEPER_NOTIFY`, since the window `--reopen` ran in usually closes. launchd jobs run with a short `PATH` (`~/.local/bin`, Homebrew, system folders), so
 use a full path for anything else.
 
 Example `~/.config/session-keeper/config` for someone who keeps secrets in a password manager and
