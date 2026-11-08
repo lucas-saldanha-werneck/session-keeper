@@ -14,6 +14,15 @@ Usage:
   claude-save --reopen --no-window   sessions that had no window come back as detached tmux sessions
                                      (default: each gets its own window)
   claude-save --reopen --file X      use another save file
+  claude-save --post-boot            run $SESSION_KEEPER_POST_BOOT and send what it prints to
+                                     $SESSION_KEEPER_NOTIFY (claude-boot-reopen calls this after login)
+
+Your own commands (settings, see the README):
+  SESSION_KEEPER_PRE_SAVE     runs before a manual save; a failure is shown, the save goes on
+  SESSION_KEEPER_PRE_REOPEN   runs before --reopen opens anything; on failure a warning is shown and
+                              SESSION_KEEPER_PRE_REOPEN_FAIL_ENV (KEY=VALUE ...) is put in front of
+                              every resumed claude command
+  SESSION_KEEPER_POST_BOOT    see --post-boot
 
 What it saves:
   - every visible iTerm window: position, tabs and what runs in each (Claude -> conversation id;
@@ -35,7 +44,7 @@ from importlib.machinery import SourceFileLoader
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(BIN), "lib"))
-from sk_common import HOME, cfg, claude_dir, make_logger, notify, short_path, state_dir  # noqa: E402
+from sk_common import HOME, cfg, claude_dir, make_logger, notify, run_configured, short_path, state_dir  # noqa: E402
 
 _ld = SourceFileLoader("claude_iterm_restart", os.path.join(BIN, "claude-iterm-restart"))
 _sp = importlib.util.spec_from_loader("claude_iterm_restart", _ld)
@@ -264,9 +273,42 @@ def auto_may_save():
     return True
 
 
+def preflight(name, what):
+    """Run a user command from the settings before a save or a restore. True = fine or not set."""
+    r = run_configured(name, log)
+    if r is None or r.returncode == 0:
+        return True
+    detail = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
+    print(f"warning: {name} failed (exit {r.returncode}) before {what}" + (f": {detail[-1]}" if detail else ""))
+    return False
+
+
+def with_env(cmd, assignments):
+    """Put KEY=VALUE assignments in front of the claude command of a resume line ("cd X && ... claude")."""
+    pairs = [a for a in shlex.split(assignments) if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", a)]
+    if not pairs or " && " not in cmd:
+        return cmd
+    head, tail = cmd.split(" && ", 1)
+    return f"{head} && " + " ".join(shlex.quote(p.split("=", 1)[0]) + "=" + shlex.quote(p.split("=", 1)[1])
+                                     for p in pairs) + " " + tail
+
+
+def post_boot():
+    """--post-boot: run SESSION_KEEPER_POST_BOOT; whatever it prints goes to SESSION_KEEPER_NOTIFY."""
+    r = run_configured("SESSION_KEEPER_POST_BOOT", log)
+    if r is None:
+        return 0
+    text = (r.stdout or "").strip()
+    if text:
+        notify(text, log)
+    return 0 if r.returncode == 0 else 1
+
+
 def save(dry, auto=False):
     if auto and not auto_may_save():
         return 0
+    if not auto and not dry:
+        preflight("SESSION_KEEPER_PRE_SAVE", "saving")
     live = live_sessions()
     me = my_ancestors()
     snap = cir.take_snapshot()
@@ -509,6 +551,13 @@ def reopen(path, dry, force, newest=None):
     if dry:
         print("(dry-run: nothing opened)")
         return 0
+    if not preflight("SESSION_KEEPER_PRE_REOPEN", "reopening"):
+        fail_env = cfg("SESSION_KEEPER_PRE_REOPEN_FAIL_ENV")
+        if fail_env:
+            print(f"  resumed sessions get: {fail_env}")
+            for x in windows + detached:
+                if x.get("claude_id") and x.get("cmd"):
+                    x["cmd"] = with_env(x["cmd"], fail_env)
     log(f"reopen: save from {data['when']}: {len(windows)} window(s), {len(detached)} detached")
 
     for s in detached:
@@ -581,6 +630,12 @@ def main():
             with open(SAVE) as f:
                 newest = json.load(f)
         return reopen(path, "--dry-run" in a, "--force" in a, newest)
+    if a == ["--post-boot"]:
+        try:
+            return post_boot()
+        except Exception as e:  # runs from launchd at login: log, never crash
+            log(f"post-boot failed: {e}")
+            return 1
     if a == ["--warn"]:
         try:
             return warn_sessionstart()

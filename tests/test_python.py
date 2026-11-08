@@ -122,6 +122,8 @@ class FakeSystem:
             return self._osa(a[1])
         if prog == "notifier":
             return cp(cmd, 0, "sent")
+        if prog == "user-cmd":  # stands for the user's own pre/post commands: `user-cmd <rc> <stdout>`
+            return cp(cmd, int(cmd[1]), " ".join(cmd[2:]), "")
         return cp(cmd, 127, "", f"{prog}: not faked")
 
     def _ps(self, a):
@@ -211,7 +213,9 @@ class Base(unittest.TestCase):
     def tearDown(self):
         for p in reversed(self.patches):
             p.stop()
-        for k in ("SESSION_KEEPER_NOTIFY", "SESSION_KEEPER_IGNORE_SESSIONS", "SESSION_KEEPER_CLAUDE_ARGS"):
+        for k in ("SESSION_KEEPER_NOTIFY", "SESSION_KEEPER_IGNORE_SESSIONS", "SESSION_KEEPER_CLAUDE_ARGS",
+                  "SESSION_KEEPER_PRE_SAVE", "SESSION_KEEPER_PRE_REOPEN", "SESSION_KEEPER_PRE_REOPEN_FAIL_ENV",
+                  "SESSION_KEEPER_POST_BOOT", "SESSION_KEEPER_DROP_ENV"):
             os.environ.pop(k, None)
 
     def out(self, fn, *a, argv=None):
@@ -469,6 +473,77 @@ class TestReopen(Base):
         self.fs.proc(701, 700, f"claude --resume {SID_A}")
         self.fs.screens["%7"] = "Do you trust this folder?\n> Yes, I trust this folder\n"
         self.assertIn("trust this folder", save_mod.why_not_up(SID_A))
+
+
+class TestUserCommands(Base):
+    """SESSION_KEEPER_PRE_SAVE / PRE_REOPEN (+ FAIL_ENV) / POST_BOOT / DROP_ENV."""
+    make_save = TestReopen.make_save
+
+    def user_calls(self):
+        return [c for c in self.fs.calls if c[0] == "user-cmd"]
+
+    def test_pre_save_runs_before_manual_save_only(self):
+        self.world()
+        os.environ["SESSION_KEEPER_PRE_SAVE"] = "user-cmd 1 not ready"
+        rc, out = self.out(save_mod.save, False)
+        self.assertEqual(rc, 0)
+        self.assertIn("warning: SESSION_KEEPER_PRE_SAVE failed (exit 1) before saving: not ready", out)
+        self.assertTrue(os.path.exists(save_mod.SAVE))          # a failed check does not block the save
+        n = len(self.user_calls())
+        self.out(save_mod.save, True)                            # dry-run: not run
+        self.assertEqual(len(self.user_calls()), n)
+
+    def test_pre_reopen_ok_changes_nothing(self):
+        self.make_save()
+        os.environ["SESSION_KEEPER_PRE_REOPEN"] = "user-cmd 0 fine"
+        os.environ["SESSION_KEEPER_PRE_REOPEN_FAIL_ENV"] = "NO_SECRETS=1"
+        rc, out = self.out(save_mod.reopen, save_mod.SAVE, False, False, argv=["--reopen", "--keep-window"])
+        self.assertEqual(len(self.user_calls()), 1)
+        self.assertNotIn("warning", out)
+        self.assertFalse([c for c in self.fs.created if "NO_SECRETS" in c])
+
+    def test_pre_reopen_failure_adds_env_to_claude_commands(self):
+        self.make_save()
+        os.environ["SESSION_KEEPER_PRE_REOPEN"] = "user-cmd 1 vault locked"
+        os.environ["SESSION_KEEPER_PRE_REOPEN_FAIL_ENV"] = "NO_SECRETS=1 'NOTE=a b'"
+        rc, out = self.out(save_mod.reopen, save_mod.SAVE, False, False, argv=["--reopen", "--keep-window"])
+        self.assertIn("SESSION_KEEPER_PRE_REOPEN failed (exit 1) before reopening: vault locked", out)
+        claude = [c for c in self.fs.created if "claude --resume" in c]
+        self.assertEqual(len(claude), 3)
+        for c in claude:
+            self.assertIn("&& NO_SECRETS=1 NOTE='a b' ", c)
+        self.assertFalse([c for c in self.fs.created if "claude --resume" not in c and "NO_SECRETS" in c])
+
+    def test_pre_reopen_not_run_on_dry_run(self):
+        self.make_save()
+        os.environ["SESSION_KEEPER_PRE_REOPEN"] = "user-cmd 1 x"
+        self.out(save_mod.reopen, save_mod.SAVE, True, False, argv=["--reopen", "--dry-run"])
+        self.assertEqual(self.user_calls(), [])
+
+    def test_with_env_ignores_junk(self):
+        self.assertEqual(save_mod.with_env("cd /x && claude", "not-an-assignment"), "cd /x && claude")
+        self.assertEqual(save_mod.with_env("claude", "A=1"), "claude")
+
+    def test_post_boot_sends_output_to_notifier(self):
+        os.environ["SESSION_KEEPER_POST_BOOT"] = "user-cmd 0 Mac restarted, 3 sessions"
+        os.environ["SESSION_KEEPER_NOTIFY"] = "notifier"
+        rc, out = self.out(save_mod.main, argv=["--post-boot"])
+        self.assertEqual(rc, 0)
+        self.assertIn(["notifier", "Mac restarted, 3 sessions"], self.fs.calls)
+
+    def test_post_boot_silent_output_and_unset(self):
+        os.environ["SESSION_KEEPER_NOTIFY"] = "notifier"
+        os.environ["SESSION_KEEPER_POST_BOOT"] = "user-cmd 0"
+        self.assertEqual(self.out(save_mod.main, argv=["--post-boot"])[0], 0)
+        os.environ.pop("SESSION_KEEPER_POST_BOOT")
+        self.assertEqual(self.out(save_mod.main, argv=["--post-boot"])[0], 0)
+        self.assertFalse([c for c in self.fs.calls if c[0] == "notifier"])
+
+    def test_drop_env_from_new_iterm(self):
+        with mock.patch.dict(os.environ, {"SECRET_LOADED": "1", "KEEP_ME": "1", "SESSION_KEEPER_DROP_ENV": "SECRET_LOADED"}):
+            env = cir.clean_env()
+        self.assertNotIn("SECRET_LOADED", env)
+        self.assertIn("KEEP_ME", env)
 
 
 class TestTmuxGc(Base):

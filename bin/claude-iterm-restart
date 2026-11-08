@@ -316,7 +316,7 @@ def _close_empty(ours, reason):
 def clean_env():
     """Environment for a freshly launched iTerm. The background phase may run inside tmux or a Claude
     session; without this every new shell would inherit TMUX (and skip tmux wrappers) or NO_COLOR."""
-    drop = ("CLAUDE_AUTO_RETRY_ACTIVE", "CLAUDECODE", "NO_COLOR", "FORCE_COLOR")
+    drop = ("CLAUDE_AUTO_RETRY_ACTIVE", "CLAUDECODE", "NO_COLOR", "FORCE_COLOR") + tuple(cfg("SESSION_KEEPER_DROP_ENV").split())
     return {k: v for k, v in os.environ.items() if not k.startswith("TMUX") and k not in drop}
 
 

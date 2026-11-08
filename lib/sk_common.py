@@ -111,6 +111,26 @@ def make_logger(filename, quiet=False):
     return log
 
 
+def run_configured(name, log=None):
+    """Run the command in setting `name` (split like a shell line, no pipes; wrap those in `sh -c '...'`).
+    Returns None when the setting is empty, else a CompletedProcess. A timeout
+    (SESSION_KEEPER_HOOK_TIMEOUT seconds, default 30) or a crash comes back as code 124 / 127."""
+    cmd = cfg(name)
+    if not cmd:
+        return None
+    import shlex
+    timeout = float(cfg("SESSION_KEEPER_HOOK_TIMEOUT", "30"))
+    try:
+        r = run(shlex.split(cmd), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        r = subprocess.CompletedProcess(cmd, 124, "", f"timed out after {timeout:g} s")
+    except Exception as e:  # a bad setting must never break a save or a restore
+        r = subprocess.CompletedProcess(cmd, 127, "", str(e))
+    if log:
+        log(f"{name}: rc={r.returncode} {((r.stdout or '') + (r.stderr or '')).strip()[:120]}")
+    return r
+
+
 def notify(text, log=None):
     """Send one line of text through SESSION_KEEPER_NOTIFY (any program that takes the text as its only
     argument, e.g. a push-message script). Not set = just print it."""

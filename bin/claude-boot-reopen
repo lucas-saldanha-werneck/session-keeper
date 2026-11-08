@@ -3,6 +3,9 @@
 # Opens iTerm2 with one window that runs `claude-save --reopen`, which reopens the windows and Claude
 # Code sessions of the last save. Without iTerm2 it runs `claude-save --reopen` directly (sessions
 # come back as detached tmux sessions).
+# Afterwards, when SESSION_KEEPER_POST_BOOT is set, it waits SESSION_KEEPER_POST_BOOT_DELAY seconds
+# (default 0) and runs `claude-save --post-boot`: your command runs and what it prints goes to
+# SESSION_KEEPER_NOTIFY (e.g. a "the Mac restarted, N sessions back" message to your phone).
 # Test without opening anything: claude-boot-reopen --dry-run
 set -u
 CONF="${SESSION_KEEPER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/session-keeper/config}"
@@ -12,7 +15,9 @@ if [[ -f "$CONF" ]]; then  # KEY=VALUE lines; a variable already set in the envi
     [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
     k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
     [[ -n "${!k:-}" ]] && continue
-    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"; v="${v/#\~/$HOME}"
+    # strip one pair of surrounding quotes only (like the Python reader), so `cmd "two words"` stays intact
+    if [[ ${#v} -ge 2 && ( ( "${v:0:1}" == '"' && "${v: -1}" == '"' ) || ( "${v:0:1}" == "'" && "${v: -1}" == "'" ) ) ]]; then v="${v:1:${#v}-2}"; fi
+    v="${v/#\~/$HOME}"
     printf -v "$k" '%s' "$v"; export "${k?}"
   done < "$CONF"
 fi
@@ -29,10 +34,21 @@ DRY=0; [[ "${1:-}" == "--dry-run" ]] && DRY=1
 ARG="--reopen"; (( DRY )) && ARG="--reopen --dry-run"
 echo "$(date '+%F %T') start ($ARG)" >>"$LOG"
 
+post_boot() {
+  [[ -n "${SESSION_KEEPER_POST_BOOT:-}" ]] || return 0
+  if (( DRY )); then echo "$(date '+%F %T') dry-run: would run the post-boot command: $SESSION_KEEPER_POST_BOOT" >>"$LOG"; return 0; fi
+  sleep "${SESSION_KEEPER_POST_BOOT_DELAY:-0}"
+  echo "$(date '+%F %T') post-boot: $SESSION_KEEPER_POST_BOOT" >>"$LOG"
+  local rc=0
+  "$BIN_DIR/claude-save" --post-boot >>"$LOG" 2>&1 || rc=$?
+  echo "$(date '+%F %T') post-boot finished (exit $rc)" >>"$LOG"
+}
+
 if [[ "$(uname -s)" != Darwin || ! -d "$ITERM_APP" ]]; then
   echo "$(date '+%F %T') no iTerm2: running claude-save $ARG directly" >>"$LOG"
   # shellcheck disable=SC2086
   "$BIN_DIR/claude-save" $ARG >>"$LOG" 2>&1
+  post_boot
   exit 0
 fi
 
@@ -54,3 +70,4 @@ for t in 1 2 3 4 5 6; do
   echo "$(date '+%F %T') osascript failed (attempt $t), retrying in 10 s" >>"$LOG"
   (( DRY )) || sleep 10
 done
+post_boot

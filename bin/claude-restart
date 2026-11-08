@@ -36,7 +36,9 @@ load_config() {  # KEY=VALUE lines; a variable already set in the environment wi
     [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
     k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
     [[ -n "${!k:-}" ]] && continue
-    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"; v="${v/#\~/$HOME}"
+    # strip one pair of surrounding quotes only (like the Python reader), so `cmd "two words"` stays intact
+    if [[ ${#v} -ge 2 && ( ( "${v:0:1}" == '"' && "${v: -1}" == '"' ) || ( "${v:0:1}" == "'" && "${v: -1}" == "'" ) ) ]]; then v="${v:1:${#v}-2}"; fi
+    v="${v/#\~/$HOME}"
     printf -v "$k" '%s' "$v"; export "${k?}"
   done < "$CONF"
 }
