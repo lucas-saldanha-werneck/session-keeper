@@ -1,7 +1,7 @@
 # session-keeper settings: KEY=VALUE lines, # starts a comment.
 # Every option is listed with its default and commented out, so this file changes nothing until you
 # remove the # in front of a line and edit its value. A variable set in the environment wins over this file.
-# Details: README, "Configuration".
+# Details: README, "Settings".
 
 # Saves, history copies (last 10) and the iTerm2 snapshot
 # SESSION_KEEPER_STATE_DIR=~/.local/state/session-keeper

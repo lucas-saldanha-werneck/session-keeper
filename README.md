@@ -58,8 +58,8 @@ $ claude-restart --yes        # restarts at the end of the current turn
 As a Claude Code plugin (hooks + skill):
 
 ```
-/plugin marketplace add lucas-saldanha-werneck/session-keeper
-/plugin install session-keeper@session-keeper
+/plugin marketplace add lucas-saldanha-werneck/claude-plugins
+/plugin install session-keeper@lucas-plugins
 ```
 
 The command-line tools and the launchd jobs:
@@ -93,25 +93,23 @@ warns you about that).
 
 Requires Python 3.8+ and bash.
 
-## Your settings
+## Settings
 
 Your settings are in `~/.config/session-keeper/config` (or `$SESSION_KEEPER_CONFIG`; `$XDG_CONFIG_HOME` is
-respected). You do not have to create it: the first time the plugin starts a session, or `claude-save` really runs (`--help` and `--dry-run` write nothing),
-it is created from [`config.example`](config.example), which lists every option with its default, commented
-out, so it changes nothing until you edit a line. A file that already exists is never changed, and plugin
-updates or a new `install.sh` never touch it.
+respected), as `KEY=VALUE` lines. Environment variables with the same names work too. launchd jobs do not
+see your shell profile, so the file is the place for settings they need.
 
-## Configuration
-
-Environment variables, or the same `KEY=VALUE` lines in `~/.config/session-keeper/config`
-(launchd jobs do not see your shell profile, so the file is the place for settings they need).
+You do not have to create it: the first time the plugin starts a session, or `claude-save` really runs
+(`--help` and `--dry-run` write nothing), it is created from [`config.example`](config.example), which
+lists every option with its default, commented out, so it changes nothing until you edit a line. A file
+that already exists is never changed.
 
 **Your settings survive updates.** The config file lives outside both the plugin folder (which
 Claude Code replaces on every plugin update) and the `install.sh` copy in
-`~/.local/share/session-keeper` (replaced when you re-run it), so updating never touches it. The
-plugin's `userConfig` (`/config` in Claude Code) only reaches the plugin's hooks; the commands run
-from your shell and from launchd, so everything they read is in this file or the environment.
-`SESSION_KEEPER_CONFIG` points to another file.
+`~/.local/share/session-keeper` (replaced when you re-run it), so plugin updates or a new `install.sh`
+never touch it. The plugin's `userConfig` (`/config` in Claude Code) only reaches the plugin's hooks;
+the commands run from your shell and from launchd, so everything they read is in this file or the
+environment.
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -219,13 +217,13 @@ Python unit tests run there in CI.
 
 ```
 ./install.sh --uninstall
-/plugin uninstall session-keeper@session-keeper
+/plugin uninstall session-keeper@lucas-plugins
 ```
 
 Your saves (`~/.local/state/session-keeper`) and config (`~/.config/session-keeper`) are kept;
 delete them yourself if you want. If you added the tmux snapshot hook to `~/.tmux.conf`, remove it.
 
-## Test
+## Tests
 
 ```
 bash tests/run.sh

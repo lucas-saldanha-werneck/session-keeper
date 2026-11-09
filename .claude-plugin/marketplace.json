@@ -9,7 +9,7 @@
     {
       "name": "session-keeper",
       "source": "./",
-      "description": "Restart your Mac, iTerm2 or a single Claude Code session without losing windows or conversations: snapshot windows, tabs, tmux sessions and Claude session ids, then reopen and resume them."
+      "description": "Restart your Mac, iTerm2 or one Claude Code session without losing windows or conversations."
     }
   ]
 }
