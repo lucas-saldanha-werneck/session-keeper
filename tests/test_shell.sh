@@ -170,11 +170,20 @@ boot2() { SHELL=/bin/bash SESSION_KEEPER_CONFIG="$T/sk-config2" SESSION_KEEPER_I
 # fake osascript: answers "AppleEvent timed out" every time and never runs the command
 : >"$T/notified"; : >"$B2"; : >"$T/osa-calls"
 printf '#!/bin/bash\necho x >>"%s"\necho "28:148: execution error: iTerm got an error: AppleEvent timed out. (-1712)" >&2\nexit 1\n' "$T/osa-calls" >"$UB/osascript"; chmod +x "$UB/osascript"
-CLAUDE_BOOT_ITERM_WAIT=2 SESSION_KEEPER_POST_BOOT_WAIT=30 boot2 "$ROOT/bin/claude-boot-reopen"; rc=$?
-[[ "$(wc -l <"$T/osa-calls" | tr -d ' ')" == 1 ]] && ok "a timeout sends no second request" || bad "a timeout sends no second request" "calls: $(wc -l <"$T/osa-calls")"
+CLAUDE_BOOT_ITERM_WAIT=4 CLAUDE_BOOT_ITERM_RESEND=60 SESSION_KEEPER_POST_BOOT_WAIT=30 boot2 "$ROOT/bin/claude-boot-reopen"; rc=$?
+[[ "$(wc -l <"$T/osa-calls" | tr -d ' ')" == 1 ]] && ok "a timeout sends no other request before the resend time" || bad "a timeout sends no other request before the resend time" "calls: $(wc -l <"$T/osa-calls")"
 [[ $rc -eq 1 ]] && ok "iTerm never answered: exit 1" || bad "iTerm never answered: exit 1" "rc=$rc"
-has "the notifier hears that the reopen is still to come" "iTerm did not answer after login" "$(cat "$T/notified")"
-hasnt "and it does not say nothing will be reopened" "could not open iTerm" "$(cat "$T/notified")"
+has "the notifier hears at once that iTerm is stuck" "iTerm is not answering after login" "$(cat "$T/notified")"
+has "and, after the wait, that nothing was reopened" "nothing was reopened" "$(cat "$T/notified")"
+SK_ST="$T/home/.local/state/session-keeper"
+bash "$SK_ST/reopen.command" </dev/null >/dev/null 2>&1
+has "a request iTerm runs after that opens nothing" "reopen request ignored: iTerm ran it after claude-boot-reopen stopped waiting" "$(cat "$B2")"
+[[ ! -e "$SK_ST/reopen.out" ]] && ok "claude-save was not run by the late request" || bad "claude-save was not run by the late request" "$(cat "$SK_ST/reopen.out")"
+# the same, with a short resend time: the request is sent again while the wait lasts
+: >"$T/notified"; : >"$B2"; : >"$T/osa-calls"
+CLAUDE_BOOT_ITERM_WAIT=5 CLAUDE_BOOT_ITERM_RESEND=2 boot2 "$ROOT/bin/claude-boot-reopen"
+[[ "$(wc -l <"$T/osa-calls" | tr -d ' ')" -ge 2 ]] && ok "the request is sent again after the resend time" || bad "the request is sent again after the resend time" "calls: $(wc -l <"$T/osa-calls")"
+[[ "$(grep -c 'is not answering' "$T/notified")" == 1 ]] && ok "but the notifier hears about it once" || bad "but the notifier hears about it once" "$(cat "$T/notified")"
 # fake osascript: times out, and iTerm runs the queued command a moment later
 : >"$T/notified"; : >"$B2"; : >"$T/osa-calls"
 printf '#!/bin/bash\necho x >>"%s"\nc="$(sed -n "s/.* -l \\(.*\\)\\"$/\\1/p" <<<"$2")"\n(sleep 1; bash "$c" </dev/null >/dev/null 2>&1 &) >/dev/null 2>&1 &\necho "execution error: AppleEvent timed out. (-1712)" >&2\nexit 1\n' "$T/osa-calls" >"$UB/osascript"; chmod +x "$UB/osascript"
@@ -192,6 +201,16 @@ SESSION_KEEPER_POST_BOOT_WAIT=4 boot2 "$FK/bin/claude-boot-reopen"
 has "the duplicate is logged" "duplicate reopen request" "$(cat "$B2")"
 [[ ! -e "$T/home/.local/state/session-keeper/reopen.result" ]] && ok "a duplicate writes no result file" || bad "a duplicate writes no result file" "$(cat "$T/home/.local/state/session-keeper/reopen.result")"
 has "so post-boot does not take the duplicate for the reopen" "result=timeout" "$(cat "$T/notified")"
+# the --reopen that held the lock was started by hand and finishes: post-boot gets its result
+printf '#!/bin/bash\ncase "$1" in --reopen) (sleep 2; echo "3 4" >"%s/reopen.done") >/dev/null 2>&1 & echo "another claude-save --reopen is running: nothing opened here"; exit 3 ;; --post-boot) echo "result=$SESSION_KEEPER_REOPEN_RESULT up=$SESSION_KEEPER_REOPEN_UP total=$SESSION_KEEPER_REOPEN_TOTAL" >>"%s" ;; esac\nexit 0\n' "$SK_ST" "$T/notified" >"$FK/bin/claude-save"
+: >"$T/notified"; : >"$B2"
+SESSION_KEEPER_POST_BOOT_WAIT=40 boot2 "$FK/bin/claude-boot-reopen"
+has "a reopen started by hand gives its result to post-boot" "result=ok up=3 total=4" "$(cat "$T/notified")"
+# and a request that iTerm runs after a reopen finished opens nothing
+: >"$B2"; sleep 1; touch "$SK_ST/reopen.done"; rm -f "$SK_ST/reopen.out"
+bash "$SK_ST/reopen.command" </dev/null >/dev/null 2>&1
+has "a request after a finished reopen is ignored" "reopen request ignored: a reopen already finished after this login" "$(cat "$B2")"
+[[ ! -e "$SK_ST/reopen.out" ]] && ok "and it does not run claude-save" || bad "and it does not run claude-save" "$(cat "$SK_ST/reopen.out")"
 rm -f "$UB/uname" "$UB/osascript" "$UB/notifier" "$UB/boot-report"
 
 echo "== config readers agree (review #3, #4, #6, #10)"

@@ -527,8 +527,21 @@ class TestReopen(Base):
         self.assertIn("done: 3 of 3 conversation(s) up", out)
         self.assertEqual(len(self.fs.created), 6)
         self.assertIsNone(save_mod._reopen_lock)                    # released at the end
+        with open(save_mod.REOPEN_DONE) as f:                       # claude-boot-reopen reads this
+            self.assertEqual(f.read().split(), ["3", "3"])
         self.assertTrue(save_mod.reopen_begin())
         save_mod.reopen_end()
+
+    def test_reopen_lock_that_cannot_be_taken_does_not_block(self):
+        """A state folder where files cannot be locked: --reopen goes on; only "busy" means another run."""
+        import errno
+        lock_mod = save_mod.fcntl or save_mod.msvcrt
+        name = "flock" if save_mod.fcntl else "locking"
+        with mock.patch.object(lock_mod, name, side_effect=OSError(errno.ENOLCK, "No locks available")):
+            self.assertTrue(save_mod.reopen_begin())
+        save_mod.reopen_end()
+        with mock.patch.object(lock_mod, name, side_effect=OSError(errno.EACCES, "busy")):
+            self.assertFalse(save_mod.reopen_begin())
 
     def test_reopen_lock_is_seen_by_another_process(self):
         code = ("import os, sys\nfrom importlib.machinery import SourceFileLoader\nimport importlib.util\n"

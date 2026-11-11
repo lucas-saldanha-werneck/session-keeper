@@ -9,7 +9,8 @@
 # SESSION_KEEPER_REOPEN_UP and SESSION_KEEPER_REOPEN_TOTAL in its environment, and what it prints goes to
 # SESSION_KEEPER_NOTIFY. If iTerm2 cannot be opened, nothing is reopened, the post-boot command is skipped
 # and SESSION_KEEPER_NOTIFY gets a message instead. When iTerm2 does not answer in time, the request stays
-# in its queue: no second request is sent, and this waits CLAUDE_BOOT_ITERM_WAIT s (default 600) for it to run.
+# in its queue: this tells SESSION_KEEPER_NOTIFY and waits up to CLAUDE_BOOT_ITERM_WAIT s (default 1800) for it
+# to run. After that it gives up, and a request iTerm2 runs later opens nothing.
 # Test without opening anything: claude-boot-reopen --dry-run
 set -u
 CONF="${SESSION_KEEPER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/session-keeper/config}"
@@ -36,8 +37,9 @@ DRY=0; [[ "${1:-}" == "--dry-run" ]] && DRY=1
 ARG="--reopen"; (( DRY )) && ARG="--reopen --dry-run"
 echo "$(date '+%F %T') start ($ARG)" >>"$LOG"
 
-RES="$ST/reopen.result"; OUT="$ST/reopen.out"; STARTED="$ST/reopen.started"
-rm -f "$RES" "$RES".tmp* "$OUT" "$STARTED"
+RES="$ST/reopen.result"; OUT="$ST/reopen.out"; STARTED="$ST/reopen.started"; EXPIRED="$ST/reopen.expired"
+DONE="$ST/reopen.done"   # written by claude-save --reopen when it marks a save as restored: "<up> <total>"
+rm -f "$RES" "$RES".tmp* "$OUT" "$STARTED" "$EXPIRED"
 
 reopen_result() {  # sets RESULT (ok|failed|timeout), UP and TOTAL from the files the reopen left
   local rc line
@@ -45,6 +47,8 @@ reopen_result() {  # sets RESULT (ok|failed|timeout), UP and TOTAL from the file
   if [[ -f "$RES" ]]; then
     rc="$(tr -dc '0-9' <"$RES")"
     if [[ "${rc:-1}" == 0 ]]; then RESULT=ok; else RESULT=failed; fi
+  elif [[ -n "${CMD:-}" && "$DONE" -nt "$CMD" ]]; then  # reopened by a --reopen this script did not start
+    RESULT=ok; read -r UP TOTAL <"$DONE" || true
   fi
   line="$(grep -E '^done: [0-9]+ of [0-9]+ ' "$OUT" 2>/dev/null | tail -1)"
   if [[ "$line" =~ ^done:\ ([0-9]+)\ of\ ([0-9]+) ]]; then UP="${BASH_REMATCH[1]}"; TOTAL="${BASH_REMATCH[2]}"; fi
@@ -56,7 +60,12 @@ post_boot() {  # after the reopen finished: SESSION_KEEPER_POST_BOOT gets the re
   local wait="${SESSION_KEEPER_POST_BOOT_WAIT:-600}" delay="${SESSION_KEEPER_POST_BOOT_DELAY:-0}" i=0 rc=0
   [[ "$wait" =~ ^[0-9]+$ ]] || wait=600
   [[ "$delay" =~ ^[0-9]+$ ]] || delay=0
-  while [[ ! -f "$RES" && $i -lt $wait ]]; do sleep 2; i=$((i + 2)); done   # the reopen runs in its own window
+  local g=0
+  while [[ ! -f "$RES" && $i -lt $wait ]]; do   # the reopen runs in its own window
+    # a reopen finished, but not in our window (it was started by hand): its result file will not come
+    if [[ -n "${CMD:-}" && "$DONE" -nt "$CMD" ]]; then g=$((g + 2)); (( g > 10 )) && break; fi
+    sleep 2; i=$((i + 2))
+  done
   reopen_result
   export SESSION_KEEPER_REOPEN_RESULT="$RESULT" SESSION_KEEPER_REOPEN_UP="$UP" SESSION_KEEPER_REOPEN_TOTAL="$TOTAL"
   echo "$(date '+%F %T') reopen result: $RESULT (${UP:-?} of ${TOTAL:-?} up); post-boot in ${delay} s" >>"$LOG"
@@ -82,6 +91,14 @@ CMD="$ST/reopen.command"
 cat >"$CMD" <<EOF
 #!$SH -l
 : >"$STARTED"
+if [ -f "$EXPIRED" ]; then  # claude-boot-reopen gave up and said so: a request that runs now would surprise
+  echo "\$(date '+%F %T') reopen request ignored: iTerm ran it after claude-boot-reopen stopped waiting" >>"$LOG"
+  exit 0
+fi
+if [ "$DONE" -nt "$CMD" ]; then  # a --reopen (by hand, or an earlier request) already finished after this login
+  echo "\$(date '+%F %T') reopen request ignored: a reopen already finished after this login" >>"$LOG"
+  exit 0
+fi
 echo "claude-boot-reopen: claude-save $ARG"
 { "$BIN_DIR/claude-save" $ARG; echo \$? >"$RES.tmp.\$\$"; } 2>&1 | tee -a "$LOG" "$OUT"
 rc="\$(cat "$RES.tmp.\$\$" 2>/dev/null)"
@@ -97,35 +114,50 @@ exec $SH -l
 EOF
 chmod +x "$CMD"
 # `open -a iTerm x.command` does not run the script; osascript from launchd does.
-opened=0; pending=0
-for t in 1 2 3 4 5 6; do
+# "AppleEvent timed out" (-1712) = iTerm did not answer in time (a dialog on the screen, a busy Mac). The
+# request is not lost: it stays in iTerm's queue and runs when iTerm answers. So after a timeout this
+# waits for the request to start, and only sends another every CLAUDE_BOOT_ITERM_RESEND s (in case iTerm
+# was quit and lost it). Requests that pile up are harmless: claude-save --reopen runs one at a time, and
+# the command above ignores a request that comes after a reopen finished or after this gave up.
+budget="${CLAUDE_BOOT_ITERM_WAIT:-1800}"; [[ "$budget" =~ ^[0-9]+$ ]] || budget=1800
+resend="${CLAUDE_BOOT_ITERM_RESEND:-300}"; [[ "$resend" =~ ^[0-9]+$ ]] || resend=300
+(( DRY )) && budget=0
+opened=0; expired=0; fails=0; told=0; t=0; t0=$SECONDS
+while :; do
+  t=$((t + 1))
   err="$(osascript -e "tell application \"iTerm\" to create window with default profile command \"$SH -l $CMD\"" 2>&1)"; orc=$?
   [[ -n "$err" ]] && echo "$err" >>"$LOG"
   if (( orc == 0 )); then
     echo "$(date '+%F %T') iTerm opened with $CMD (attempt $t)" >>"$LOG"; opened=1; break
   fi
-  if [[ "$err" == *"-1712"* || -f "$STARTED" ]]; then
-    # "AppleEvent timed out" = iTerm did not answer in time (a dialog on the screen, a busy Mac), but
-    # the request stays in its queue and runs when iTerm answers. One more request = the reopen twice.
-    w="${CLAUDE_BOOT_ITERM_WAIT:-600}"; [[ "$w" =~ ^[0-9]+$ ]] || w=600
-    (( DRY )) && w=0
-    echo "$(date '+%F %T') iTerm did not answer in time (attempt $t); the request stays in its queue, so no other is sent. Waiting up to $w s for it to start" >>"$LOG"
-    i=0
-    while [[ ! -f "$STARTED" && $i -lt $w ]]; do sleep 2; i=$((i + 2)); done
-    if [[ -f "$STARTED" ]]; then
-      echo "$(date '+%F %T') iTerm ran the request (after about $i s more)" >>"$LOG"; opened=1
-    else
-      pending=1
-    fi
-    break
+  if [[ -f "$STARTED" ]]; then
+    echo "$(date '+%F %T') osascript reported an error (attempt $t), but iTerm ran the request" >>"$LOG"; opened=1; break
   fi
+  if [[ "$err" == *"-1712"* ]]; then
+    if (( ! told )); then
+      told=1
+      echo "$(date '+%F %T') iTerm did not answer in time (attempt $t); the request stays in its queue. Waiting up to $budget s in all for it to start" >>"$LOG"
+      (( DRY )) || "$BIN_DIR/claude-save" --notify "claude-boot-reopen: iTerm is not answering after login (a dialog may be waiting on the screen). The reopen starts when it answers. Log: $LOG" >>"$LOG" 2>&1
+    fi
+    i=0
+    while [[ ! -f "$STARTED" && $i -lt $resend && $((SECONDS - t0)) -lt $budget ]]; do sleep 2; i=$((i + 2)); done
+    if [[ -f "$STARTED" ]]; then
+      echo "$(date '+%F %T') iTerm ran the request ($((SECONDS - t0)) s after the first attempt)" >>"$LOG"; opened=1; break
+    fi
+    if (( SECONDS - t0 >= budget )); then expired=1; break; fi
+    echo "$(date '+%F %T') still no answer after attempt $t: sending the request again" >>"$LOG"
+    continue
+  fi
+  fails=$((fails + 1))
+  (( fails >= 6 )) && break
   echo "$(date '+%F %T') osascript failed (attempt $t), retrying in ${CLAUDE_BOOT_RETRY_DELAY:-10} s" >>"$LOG"
   (( DRY )) || sleep "${CLAUDE_BOOT_RETRY_DELAY:-10}"
 done
 if (( ! opened )); then  # no reopen to wait for, so no post-boot; say so instead
-  if (( pending )); then
-    echo "$(date '+%F %T') iTerm still does not answer: nothing reopened yet, post-boot skipped; the reopen starts when iTerm answers" >>"$LOG"
-    (( DRY )) || "$BIN_DIR/claude-save" --notify "claude-boot-reopen: iTerm did not answer after login (a dialog may be waiting on the screen). The reopen starts by itself when iTerm answers; if it does not, run claude-save --reopen yourself. Log: $LOG" >>"$LOG" 2>&1
+  if (( expired )); then
+    : >"$EXPIRED"   # from now on a request that iTerm still holds opens nothing
+    echo "$(date '+%F %T') iTerm did not answer for $budget s: nothing reopened, post-boot skipped" >>"$LOG"
+    (( DRY )) || "$BIN_DIR/claude-save" --notify "claude-boot-reopen: iTerm did not answer for $budget s after login, nothing was reopened. Run claude-save --reopen yourself. Log: $LOG" >>"$LOG" 2>&1
   else
     echo "$(date '+%F %T') could not open iTerm: nothing reopened, post-boot skipped" >>"$LOG"
     (( DRY )) || "$BIN_DIR/claude-save" --notify "claude-boot-reopen: could not open iTerm after login, nothing was reopened. Run claude-save --reopen yourself. Log: $LOG" >>"$LOG" 2>&1
