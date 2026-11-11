@@ -151,5 +151,5 @@ Optional, for claude-iterm-restart --reopen after a crash (keeps a fresh snapsho
   set-hook -g client-focus-in 'run-shell -b "$SHARE/bin/claude-iterm-restart --snapshot --quiet >/dev/null 2>&1 || true"'
 Hooks (auto-save warning, claude-restart at end of turn, folder titles) come with the Claude Code plugin:
   /plugin marketplace add lucas-saldanha-werneck/claude-plugins
-  /plugin install session-keeper@lucas-plugins
+  /plugin install session-keeper@lucas-tools
 EOF

@@ -59,7 +59,7 @@ As a Claude Code plugin (hooks + skill):
 
 ```
 /plugin marketplace add lucas-saldanha-werneck/claude-plugins
-/plugin install session-keeper@lucas-plugins
+/plugin install session-keeper@lucas-tools
 ```
 
 The command-line tools and the launchd jobs:
@@ -225,7 +225,7 @@ Python unit tests run there in CI.
 
 ```
 ./install.sh --uninstall
-/plugin uninstall session-keeper@lucas-plugins
+/plugin uninstall session-keeper@lucas-tools
 ```
 
 Your saves (`~/.local/state/session-keeper`) and config (`~/.config/session-keeper`) are kept;
