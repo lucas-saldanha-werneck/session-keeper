@@ -58,7 +58,7 @@ $ claude-restart --yes        # restarts at the end of the current turn
 As a Claude Code plugin (hooks + skill):
 
 ```
-/plugin marketplace add lucas-saldanha-werneck/claude-plugins
+/plugin marketplace add lucas-saldanha-werneck/lucas-tools
 /plugin install session-keeper@lucas-tools
 ```
 
