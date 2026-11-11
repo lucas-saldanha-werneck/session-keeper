@@ -71,6 +71,12 @@ touch -t 202001010000 "$T/claude/projects/$SLUG/$SID.jsonl"   # the live session
 echo "== claude-restart"
 out="$(cd "$T/proj" && "$R" 2>&1)"
 has "plan finds the tmux session" "SESSION  : work" "$out"
+# an app entrypoint INHERITED by a terminal session (tmux server started from an app session): tmux wins
+APPENV=(CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee CLAUDE_CODE_SESSION_ID=$SID)
+out="$(cd "$T/proj" && env "${APPENV[@]}" SESSION_KEEPER_UNDER_TERMINAL=1 "$R" 2>&1)"
+has "inherited app entrypoint under a terminal: tmux plan" "SESSION  : work" "$out"
+out="$(cd "$T/proj" && env "${APPENV[@]}" SESSION_KEEPER_UNDER_TERMINAL=0 "$R" 2>&1)"
+has "real app session (no terminal): app plan" "SESSION  : desktop app local_aaaaaaaa" "$out"
 has "plan uses the live Claude's id, not the newest transcript" "RESUME ID: $SID" "$out"
 has "plan only, nothing done" "PLAN (nothing done" "$out"
 has "warns that the Stop hook is not registered" "Stop hook is NOT registered" "$out"

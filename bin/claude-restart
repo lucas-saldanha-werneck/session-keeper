@@ -65,6 +65,20 @@ log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
 file_size() { stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null || echo 0; }
 is_macos() { [[ "$(uname -s)" == Darwin || "${SESSION_KEEPER_ASSUME_MACOS:-}" == 1 ]]; }
 
+# True when an ancestor of this process has a terminal (the terminal's `claude`). A desktop app session's
+# processes have none ("??"). Needed because CLAUDE_CODE_ENTRYPOINT=claude-desktop can be INHERITED by a
+# terminal session (a tmux server started from an app session keeps it for every pane).
+under_terminal() {
+  [[ -n "${SESSION_KEEPER_UNDER_TERMINAL:-}" ]] && { [[ "$SESSION_KEEPER_UNDER_TERMINAL" == 1 ]]; return; }
+  local p=$$ t n=0
+  while [[ -n "$p" && "$p" != 0 && "$p" != 1 && $n -lt 25 ]]; do
+    t="$(ps -o tty= -p "$p" 2>/dev/null | tr -d ' ')"
+    [[ -n "$t" && "$t" != "??" && "$t" != "?" ]] && return 0
+    p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"; n=$((n + 1))
+  done
+  return 1
+}
+
 hook_registered() {
   grep -qE 'claude-restart[\\"]* --stop-hook' "$CLAUDE_DIR/settings.json" 2>/dev/null && return 0
   grep -q 'session-keeper' "$CLAUDE_DIR/plugins/installed_plugins.json" 2>/dev/null && return 0
@@ -294,7 +308,7 @@ APP_SID="${CLAUDE_CODE_SESSION_ID:-}"; APP_HOST="${CLAUDE_CODE_HOST_SESSION_ID:-
 SLUG="$(printf '%s' "$TARGET" | sed 's#[^A-Za-z0-9]#-#g')"
 DIR="$PROJ_ROOT/$SLUG"
 if [[ "${CLAUDE_CODE_ENTRYPOINT:-}" == claude-desktop && "$APP_HOST" =~ ^local_[0-9a-f-]{36}$ \
-      && -n "$APP_SID" && -f "$DIR/$APP_SID.jsonl" ]]; then
+      && -n "$APP_SID" && -f "$DIR/$APP_SID.jsonl" ]] && ! under_terminal; then
   echo "FOLDER   : $TARGET"
   echo "SESSION  : desktop app $APP_HOST"
   echo "RESUME ID: $APP_SID   (last write: $(date -r "$DIR/$APP_SID.jsonl" '+%Y-%m-%d %H:%M'))"
