@@ -432,7 +432,7 @@ class TestAuto(Base):
         args = lambda pid: "python3 /x/bin/claude-save --auto" if pid in alive else ""
         kill = lambda pid, sig: (killed.append(pid), alive.discard(pid))
         with mock.patch.object(save_mod, "proc_args", args), mock.patch.object(save_mod.os, "kill", kill), \
-                mock.patch.object(save_mod.signal, "alarm") as alarm:
+                mock.patch.object(save_mod.signal, "alarm", create=True) as alarm:
             self.assertTrue(save_mod.auto_begin(60))                   # nothing running: starts, deadline armed
             alarm.assert_called_with(60)
             with open(save_mod.AUTO_PID) as f:
@@ -465,12 +465,12 @@ class TestAuto(Base):
         with open(save_mod.AUTO_PID, "w") as f:
             f.write(f"4242 {time.time() - 5}")
         with mock.patch.object(save_mod, "proc_args", lambda pid: "python3 claude-save --auto"), \
-                mock.patch.object(save_mod.signal, "alarm"):
+                mock.patch.object(save_mod.signal, "alarm", create=True):
             rc, _ = self.out(save_mod.main, argv=["--auto"])
         self.assertEqual(rc, 0)
         self.assertFalse(os.path.exists(save_mod.SAVE))                # skipped: nothing saved
         os.remove(save_mod.AUTO_PID)
-        with mock.patch.object(save_mod.signal, "alarm"):
+        with mock.patch.object(save_mod.signal, "alarm", create=True):
             rc, _ = self.out(save_mod.main, argv=["--auto"])
         self.assertTrue(os.path.exists(save_mod.SAVE))                 # free: saves, and leaves no pid file
         self.assertFalse(os.path.exists(save_mod.AUTO_PID))

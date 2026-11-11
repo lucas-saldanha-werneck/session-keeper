@@ -661,7 +661,7 @@ def auto_begin(deadline):
             if now - started <= deadline:
                 return False  # the previous run is still inside its deadline
             try:
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
             except OSError:
                 pass
             time.sleep(0.2)
@@ -676,12 +676,14 @@ def auto_begin(deadline):
     os.makedirs(STATE, exist_ok=True)
     with open(AUTO_PID, "w") as f:
         f.write(f"{os.getpid()} {now}")
-    signal.alarm(max(1, int(deadline)))  # default action: the process ends, even inside a blocked call
+    if hasattr(signal, "alarm"):  # not on Windows; there only the one-at-a-time check applies
+        signal.alarm(max(1, int(deadline)))  # default action: the process ends, even inside a blocked call
     return True
 
 
 def auto_end():
-    signal.alarm(0)
+    if hasattr(signal, "alarm"):
+        signal.alarm(0)
     try:
         os.remove(AUTO_PID)
     except OSError:
