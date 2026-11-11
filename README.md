@@ -129,6 +129,7 @@ environment.
 | `SESSION_KEEPER_APP_NUDGE` | empty | Desktop app only: a command that gets `<session id> <message>` after `claude-restart` stopped an app session, to send it a message so it restarts right away |
 | `CLAUDE_AUTO_RETRY_LAUNCHER` | Homebrew/npm global path | `claude-restart` restarts through the claude-auto-retry launcher when it is installed |
 | `CLAUDE_SAVE_WAIT` | `60` | Seconds `--reopen` waits for the conversations to come up |
+| `SESSION_KEEPER_AUTO_DEADLINE` | `60` | Seconds one `claude-save --auto` run may take before it is ended |
 | `SESSION_KEEPER_PRE_SAVE` | empty | A command run before a manual `claude-save` (not `--auto`, not `--dry-run`). If it fails, a warning with its last output line is shown; the save still happens |
 | `SESSION_KEEPER_PRE_REOPEN` | empty | A command run before `--reopen` opens anything, e.g. a check that your secrets manager is unlocked. If it fails, a warning is shown and the reopen goes on |
 | `SESSION_KEEPER_PRE_REOPEN_FAIL_ENV` | empty | `KEY=VALUE` pairs put in front of every resumed `claude` command when `SESSION_KEEPER_PRE_REOPEN` failed (e.g. a flag that tells your shell wrapper not to wait for secrets) |
@@ -202,6 +203,9 @@ Python unit tests run there in CI.
 - `claude-save --auto` does not overwrite a save made before the tmux server started (a reboot)
   until it has been reopened, so the Mac starting empty cannot erase the good save. After 24 hours
   the old save is treated as abandoned.
+- One `claude-save --auto` runs at a time, and it ends itself after `SESSION_KEEPER_AUTO_DEADLINE`
+  seconds. When a file open hangs (a stuck file provider, for example), the runs that launchd starts
+  every 5 minutes do not pile up: the next one stops the hung run, or skips if it cannot.
 - Windows close one by one before a restart, and `--auto` may save the shrinking list. `--reopen`
   therefore uses, among the copies from the hour before the newest save, the one with the most
   conversations.

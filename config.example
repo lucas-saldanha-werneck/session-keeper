@@ -54,6 +54,9 @@
 # Seconds --reopen waits for the conversations to come up
 # CLAUDE_SAVE_WAIT=60
 
+# Seconds one claude-save --auto run may take before it is ended (so hung runs do not pile up)
+# SESSION_KEEPER_AUTO_DEADLINE=60
+
 # Seconds --reopen waits in a new window-less tmux session before typing its saved command back
 # CLAUDE_SAVE_TYPE_DELAY=1
 

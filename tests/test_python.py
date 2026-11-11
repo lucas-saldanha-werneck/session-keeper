@@ -422,6 +422,59 @@ class TestAuto(Base):
         self.assertEqual(d["windows"], [])
         self.assertIn(SID_A, [s.get("claude_id") for s in d["detached"]])  # 'work' is now window-less
 
+    def auto_log(self):
+        with open(os.path.join(os.environ["SESSION_KEEPER_LOG_DIR"], "claude-save.log")) as f:
+            return f.read()
+
+    def test_auto_one_at_a_time_with_a_deadline(self):
+        os.makedirs(save_mod.STATE, exist_ok=True)
+        killed, alive = [], {4242}
+        args = lambda pid: "python3 /x/bin/claude-save --auto" if pid in alive else ""
+        kill = lambda pid, sig: (killed.append(pid), alive.discard(pid))
+        with mock.patch.object(save_mod, "proc_args", args), mock.patch.object(save_mod.os, "kill", kill), \
+                mock.patch.object(save_mod.signal, "alarm") as alarm:
+            self.assertTrue(save_mod.auto_begin(60))                   # nothing running: starts, deadline armed
+            alarm.assert_called_with(60)
+            with open(save_mod.AUTO_PID) as f:
+                self.assertEqual(int(f.read().split()[0]), os.getpid())
+            save_mod.auto_end()
+            self.assertFalse(os.path.exists(save_mod.AUTO_PID))
+            with open(save_mod.AUTO_PID, "w") as f:                    # a run started 10 s ago is still alive
+                f.write(f"4242 {time.time() - 10}")
+            self.assertFalse(save_mod.auto_begin(60))                  # inside its deadline: this run does not start
+            self.assertEqual(killed, [])
+            with open(save_mod.AUTO_PID, "w") as f:                    # the same run, 5 minutes later: hung
+                f.write(f"4242 {time.time() - 300}")
+            self.assertTrue(save_mod.auto_begin(60))                   # stopped, and this run takes over
+            self.assertEqual(killed, [4242])
+            self.assertIn("stopped it", self.auto_log())
+            with open(save_mod.AUTO_PID, "w") as f:                    # a hung run that does not die
+                f.write(f"4243 {time.time() - 300}")
+            alive.add(4243)
+            with mock.patch.object(save_mod.os, "kill", lambda pid, sig: None):
+                self.assertFalse(save_mod.auto_begin(60))              # no pile-up: skip
+            self.assertIn("does not die", self.auto_log())
+            alive.clear()                                              # pid file left by a run that the alarm ended
+            self.assertTrue(save_mod.auto_begin(60))
+            self.assertIn("did not finish", self.auto_log())
+            save_mod.auto_end()
+
+    def test_auto_cli_skips_while_another_run_is_alive(self):
+        self.world()
+        os.makedirs(save_mod.STATE, exist_ok=True)
+        with open(save_mod.AUTO_PID, "w") as f:
+            f.write(f"4242 {time.time() - 5}")
+        with mock.patch.object(save_mod, "proc_args", lambda pid: "python3 claude-save --auto"), \
+                mock.patch.object(save_mod.signal, "alarm"):
+            rc, _ = self.out(save_mod.main, argv=["--auto"])
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.exists(save_mod.SAVE))                # skipped: nothing saved
+        os.remove(save_mod.AUTO_PID)
+        with mock.patch.object(save_mod.signal, "alarm"):
+            rc, _ = self.out(save_mod.main, argv=["--auto"])
+        self.assertTrue(os.path.exists(save_mod.SAVE))                 # free: saves, and leaves no pid file
+        self.assertFalse(os.path.exists(save_mod.AUTO_PID))
+
 
 class TestReopen(Base):
     def make_save(self):
