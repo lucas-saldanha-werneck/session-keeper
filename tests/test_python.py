@@ -506,6 +506,50 @@ class TestReopen(Base):
         self.assertEqual(rc, 1)
         self.assertIn("already restored", out)
 
+    def test_one_reopen_at_a_time(self):
+        """Several --reopen started together (requests that waited in iTerm's queue): one opens, the
+        others open nothing and exit 3."""
+        self.make_save()
+        self.assertTrue(save_mod.reopen_begin())                    # "the other --reopen", still running
+        other, save_mod._reopen_lock = save_mod._reopen_lock, None
+        try:
+            rc, out = self.out(save_mod.main, argv=["--reopen", "--keep-window"])
+            self.assertEqual(rc, 3, out)
+            self.assertIn("another claude-save --reopen is running", out)
+            self.assertEqual(self.fs.created, [])
+            self.assertFalse(self.saved().get("restored_at"))
+            rc, out = self.out(save_mod.main, argv=["--reopen", "--dry-run"])
+            self.assertEqual(rc, 0, out)                            # --dry-run opens nothing: no lock needed
+        finally:
+            other.close()                                           # the other one ended
+        rc, out = self.out(save_mod.main, argv=["--reopen", "--keep-window"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("done: 3 of 3 conversation(s) up", out)
+        self.assertEqual(len(self.fs.created), 6)
+        self.assertIsNone(save_mod._reopen_lock)                    # released at the end
+        self.assertTrue(save_mod.reopen_begin())
+        save_mod.reopen_end()
+
+    def test_reopen_lock_is_seen_by_another_process(self):
+        code = ("import os, sys\nfrom importlib.machinery import SourceFileLoader\nimport importlib.util\n"
+                f"sys.path.insert(0, {os.path.join(ROOT, 'lib')!r})\n"
+                f"ld = SourceFileLoader('cs', {os.path.join(ROOT, 'bin', 'claude-save')!r})\n"
+                "m = importlib.util.module_from_spec(importlib.util.spec_from_loader('cs', ld))\nld.exec_module(m)\n"
+                "print('got' if m.reopen_begin() else 'busy')\n")
+
+        def other_process():
+            return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+        self.assertTrue(save_mod.reopen_begin())
+        try:
+            r = other_process()
+            self.assertEqual(r.stdout.strip(), "busy", r.stderr)
+        finally:
+            save_mod.reopen_end()
+        r = other_process()
+        self.assertEqual(r.stdout.strip(), "got", r.stderr)         # and a lock left by a dead process is gone
+        self.assertTrue(save_mod.reopen_begin())
+        save_mod.reopen_end()
+
     def test_no_window_flag_starts_detached_tmux(self):
         self.make_save()
         rc, out = self.out(save_mod.reopen, save_mod.SAVE, False, False, argv=["--reopen", "--no-window", "--keep-window"])

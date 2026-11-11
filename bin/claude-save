@@ -7,7 +7,8 @@ Usage:
   claude-save --auto                 for launchd (every 5 min): saves only when something changed; does NOT
                                      overwrite a pre-boot save that has not been reopened yet
   claude-save --warn                 SessionStart hook: warns when --auto is paused waiting for --reopen
-  claude-save --reopen               AFTER restarting (in an iTerm window): reopen everything
+  claude-save --reopen               AFTER restarting (in an iTerm window): reopen everything. One at a
+                                     time: a --reopen started while another one runs opens nothing (exit 3)
   claude-save --reopen --dry-run     show the plan without opening anything
   claude-save --reopen --force       reopen a save that was already restored
   claude-save --reopen --keep-window do not close the window --reopen was run from
@@ -43,7 +44,16 @@ Log: claude-save.log in $SESSION_KEEPER_LOG_DIR (default ~/Library/Logs).
 import glob, importlib.util, json, os, re, shlex, signal, subprocess, sys, time
 from importlib.machinery import SourceFileLoader
 
-BIN = os.path.dirname(os.path.realpath(__file__))
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:  # not Windows
+    msvcrt = None
+
+BIN =os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(BIN), "lib"))
 from sk_common import HOME, cfg, cfg_number, claude_dir, make_logger, notify, run_configured, seed_config, short_path, state_dir  # noqa: E402
 
@@ -55,6 +65,8 @@ _ld.exec_module(cir)
 STATE = state_dir()
 SAVE = os.path.join(STATE, "save.json")
 AUTO_PID = os.path.join(STATE, "auto.pid")  # "<pid> <start, epoch seconds>" of the --auto run in progress
+REOPEN_LOCK = os.path.join(STATE, "reopen.lock")  # held (OS file lock) by the --reopen in progress
+_reopen_lock = None
 SHELLS = cir.SHELLS
 PRESENCE_VAR = "CLAUDE_CODE_DISABLE_NOTIFICATION_PRESENCE_CHECK"
 log = make_logger("claude-save.log")
@@ -644,6 +656,38 @@ def reopen(path, dry, force, newest=None):
     return 0
 
 
+def reopen_begin():
+    """One --reopen at a time. When iTerm does not answer after login, several requests to run --reopen
+    can wait in its queue and all start in the same second; each one read the save before any of them
+    marked it as restored, so every window came back several times. The lock is an OS file lock: it
+    goes away with the process, so a killed --reopen never blocks the next one.
+    False = another --reopen is running."""
+    global _reopen_lock
+    os.makedirs(STATE, exist_ok=True)
+    f = open(REOPEN_LOCK, "a+")
+    try:
+        if fcntl:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif msvcrt:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        f.close()
+        return False
+    _reopen_lock = f
+    return True
+
+
+def reopen_end():
+    global _reopen_lock
+    if _reopen_lock:
+        try:
+            _reopen_lock.close()  # closing the file releases the lock
+        except OSError:
+            pass
+        _reopen_lock = None
+
+
 def auto_begin(deadline):
     """One --auto at a time, and none that lasts forever. launchd starts one every 5 minutes; when a
     file open hangs (a stuck file provider, a full sandbox queue) a run never returns, and without
@@ -712,11 +756,20 @@ def main():
         if not os.path.exists(path):
             print(f"{path} not found. Run claude-save before restarting.")
             return 1
-        newest = None
-        if "--file" not in a and path != SAVE:
-            with open(SAVE) as f:
-                newest = json.load(f)
-        return reopen(path, "--dry-run" in a, "--force" in a, newest)
+        dry = "--dry-run" in a
+        # the lock comes before any save file is read: "already restored" is only true under it
+        if not dry and not reopen_begin():
+            print("another claude-save --reopen is running: nothing opened here")
+            log("reopen: another --reopen is running; this one opens nothing")
+            return 3
+        try:
+            newest = None
+            if "--file" not in a and path != SAVE:
+                with open(SAVE) as f:
+                    newest = json.load(f)
+            return reopen(path, dry, "--force" in a, newest)
+        finally:
+            reopen_end()
     if a[:1] == ["--notify"] and len(a) == 2:  # used by claude-boot-reopen
         return 0 if notify(a[1], log) else 1
     if a == ["--post-boot"]:

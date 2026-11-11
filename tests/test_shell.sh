@@ -163,6 +163,35 @@ SHELL=/bin/bash SESSION_KEEPER_CONFIG="$T/sk-config2" SESSION_KEEPER_ITERM_APP="
 [[ $rc -eq 1 ]] && ok "iTerm could not be opened: exit 1" || bad "iTerm could not be opened: exit 1" "rc=$rc"
 hasnt "and the post-boot command is skipped" "result=" "$(cat "$T/notified")"
 has "the failure goes to the notifier instead" "could not open iTerm after login" "$(cat "$T/notified")"
+
+echo "== claude-boot-reopen: iTerm does not answer in time (the request stays in its queue)"
+boot2() { SHELL=/bin/bash SESSION_KEEPER_CONFIG="$T/sk-config2" SESSION_KEEPER_ITERM_APP="$T/iTerm.app" SESSION_KEEPER_LOG_DIR="$L2" \
+  CLAUDE_BOOT_REOPEN_DELAY=0 CLAUDE_BOOT_RETRY_DELAY=0 "$@"; }
+# fake osascript: answers "AppleEvent timed out" every time and never runs the command
+: >"$T/notified"; : >"$B2"; : >"$T/osa-calls"
+printf '#!/bin/bash\necho x >>"%s"\necho "28:148: execution error: iTerm got an error: AppleEvent timed out. (-1712)" >&2\nexit 1\n' "$T/osa-calls" >"$UB/osascript"; chmod +x "$UB/osascript"
+CLAUDE_BOOT_ITERM_WAIT=2 SESSION_KEEPER_POST_BOOT_WAIT=30 boot2 "$ROOT/bin/claude-boot-reopen"; rc=$?
+[[ "$(wc -l <"$T/osa-calls" | tr -d ' ')" == 1 ]] && ok "a timeout sends no second request" || bad "a timeout sends no second request" "calls: $(wc -l <"$T/osa-calls")"
+[[ $rc -eq 1 ]] && ok "iTerm never answered: exit 1" || bad "iTerm never answered: exit 1" "rc=$rc"
+has "the notifier hears that the reopen is still to come" "iTerm did not answer after login" "$(cat "$T/notified")"
+hasnt "and it does not say nothing will be reopened" "could not open iTerm" "$(cat "$T/notified")"
+# fake osascript: times out, and iTerm runs the queued command a moment later
+: >"$T/notified"; : >"$B2"; : >"$T/osa-calls"
+printf '#!/bin/bash\necho x >>"%s"\nc="$(sed -n "s/.* -l \\(.*\\)\\"$/\\1/p" <<<"$2")"\n(sleep 1; bash "$c" </dev/null >/dev/null 2>&1 &) >/dev/null 2>&1 &\necho "execution error: AppleEvent timed out. (-1712)" >&2\nexit 1\n' "$T/osa-calls" >"$UB/osascript"; chmod +x "$UB/osascript"
+CLAUDE_BOOT_ITERM_WAIT=20 SESSION_KEEPER_POST_BOOT_WAIT=30 boot2 "$ROOT/bin/claude-boot-reopen"; rc=$?
+[[ $rc -eq 0 && "$(wc -l <"$T/osa-calls" | tr -d ' ')" == 1 ]] && ok "late answer: one request, and the boot goes on" || bad "late answer" "rc=$rc calls=$(wc -l <"$T/osa-calls") $(cat "$B2")"
+has "the late start is logged" "iTerm ran the request" "$(cat "$B2")"
+has "post-boot still gets the result" "result=failed" "$(cat "$T/notified")"
+
+echo "== claude-boot-reopen: a duplicate reopen window (claude-save exits 3) leaves no result"
+FK="$T/fk"; mkdir -p "$FK/bin" "$FK/lib"; cp "$ROOT/bin/claude-boot-reopen" "$FK/bin/"; cp "$ROOT/lib/sk_config.sh" "$FK/lib/"
+printf '#!/bin/bash\ncase "$1" in --reopen) echo "another claude-save --reopen is running: nothing opened here"; exit 3 ;; --post-boot) echo "result=$SESSION_KEEPER_REOPEN_RESULT" >>"%s" ;; esac\nexit 0\n' "$T/notified" >"$FK/bin/claude-save"; chmod +x "$FK/bin/claude-save"
+printf '#!/bin/bash\nc="$(sed -n "s/.* -l \\(.*\\)\\"$/\\1/p" <<<"$2")"\n[ -n "$c" ] && (bash "$c" </dev/null >/dev/null 2>&1 &)\nexit 0\n' >"$UB/osascript"; chmod +x "$UB/osascript"
+: >"$T/notified"; : >"$B2"
+SESSION_KEEPER_POST_BOOT_WAIT=4 boot2 "$FK/bin/claude-boot-reopen"
+has "the duplicate is logged" "duplicate reopen request" "$(cat "$B2")"
+[[ ! -e "$T/home/.local/state/session-keeper/reopen.result" ]] && ok "a duplicate writes no result file" || bad "a duplicate writes no result file" "$(cat "$T/home/.local/state/session-keeper/reopen.result")"
+has "so post-boot does not take the duplicate for the reopen" "result=timeout" "$(cat "$T/notified")"
 rm -f "$UB/uname" "$UB/osascript" "$UB/notifier" "$UB/boot-report"
 
 echo "== config readers agree (review #3, #4, #6, #10)"

@@ -76,6 +76,10 @@
 # CLAUDE_BOOT_REOPEN_DELAY=20
 # CLAUDE_BOOT_RETRY_DELAY=10
 
+# Seconds claude-boot-reopen waits for iTerm2 to run the reopen when iTerm2 did not answer in time
+# (a dialog on the screen, a busy Mac). The request stays in iTerm2's queue; no second one is sent.
+# CLAUDE_BOOT_ITERM_WAIT=600
+
 # A command run before a manual claude-save (empty: none). A failure only warns
 # SESSION_KEEPER_PRE_SAVE=
 
