@@ -133,7 +133,8 @@ environment.
 | `SESSION_KEEPER_PRE_SAVE` | empty | A command run before a manual `claude-save` (not `--auto`, not `--dry-run`). If it fails, a warning with its last output line is shown; the save still happens |
 | `SESSION_KEEPER_PRE_REOPEN` | empty | A command run before `--reopen` opens anything, e.g. a check that your secrets manager is unlocked. If it fails, a warning is shown and the reopen goes on |
 | `SESSION_KEEPER_PRE_REOPEN_FAIL_ENV` | empty | `KEY=VALUE` pairs put in front of every resumed `claude` command when `SESSION_KEEPER_PRE_REOPEN` failed (e.g. a flag that tells your shell wrapper not to wait for secrets) |
-| `SESSION_KEEPER_POST_BOOT` | empty | A command `claude-boot-reopen` runs once the reopen has finished (through `claude-save --post-boot`). It gets `SESSION_KEEPER_REOPEN_RESULT` (`ok`, `failed` or `timeout`), `SESSION_KEEPER_REOPEN_UP` and `SESSION_KEEPER_REOPEN_TOTAL` (conversations back / expected) in its environment, and whatever it prints is sent to `SESSION_KEEPER_NOTIFY`. If iTerm2 cannot be opened at all, nothing is reopened, the command is skipped and the notifier gets a message instead |
+| `SESSION_KEEPER_POST_BOOT` | empty | A command `claude-boot-reopen` runs once the reopen has finished (through `claude-save --post-boot`). It gets `SESSION_KEEPER_REOPEN_RESULT` (`ok`, `failed` or `timeout`), `SESSION_KEEPER_REOPEN_UP` and `SESSION_KEEPER_REOPEN_TOTAL` (conversations back / expected) in its environment, and whatever it prints is sent to `SESSION_KEEPER_NOTIFY`. If iTerm2 cannot be opened at all, or does not answer within `CLAUDE_BOOT_ITERM_WAIT`, nothing is reopened, the command is skipped and the notifier gets a message instead |
+| `CLAUDE_BOOT_ITERM_WAIT` | `1800` | When iTerm2 does not answer after login (a dialog on the screen, a busy Mac), the reopen request stays in its queue and runs when iTerm2 answers. `claude-boot-reopen` tells the notifier at once, waits this many seconds in all, and sends the request again every `CLAUDE_BOOT_ITERM_RESEND` seconds (`300`). After the wait it gives up, and a request iTerm2 runs later opens nothing |
 | `SESSION_KEEPER_POST_BOOT_WAIT` | `600` | Longest wait, in seconds, for the reopen to finish before the post-boot command runs anyway (with `timeout`) |
 | `SESSION_KEEPER_POST_BOOT_DELAY` | `0` | Extra seconds after the reopen finished, before the post-boot command |
 | `SESSION_KEEPER_HOOK_TIMEOUT` | `30` | Seconds each of the three commands above may take; a timeout counts as a failure. A value that is not a number is ignored with a warning |
@@ -206,6 +207,9 @@ Python unit tests run there in CI.
 - One `claude-save --auto` runs at a time, and it ends itself after `SESSION_KEEPER_AUTO_DEADLINE`
   seconds. When a file open hangs (a stuck file provider, for example), the runs that launchd starts
   every 5 minutes do not pile up: the next one stops the hung run, or skips if it cannot.
+- One `claude-save --reopen` runs at a time (a file lock in the state folder). A `--reopen` started
+  while another one runs opens nothing and exits with 3. This is what keeps windows from coming back
+  several times when iTerm2 was stuck at login and then runs every reopen request it held at once.
 - Windows close one by one before a restart, and `--auto` may save the shrinking list. `--reopen`
   therefore uses, among the copies from the hour before the newest save, the one with the most
   conversations.
