@@ -40,12 +40,12 @@ Why a separate file from claude-iterm-restart's snapshot: that snapshot is retak
 after a reboot it would be replaced by a snapshot of the empty Mac.
 Log: claude-save.log in $SESSION_KEEPER_LOG_DIR (default ~/Library/Logs).
 """
-import glob, importlib.util, json, os, re, shlex, subprocess, sys, time
+import glob, importlib.util, json, os, re, shlex, signal, subprocess, sys, time
 from importlib.machinery import SourceFileLoader
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(BIN), "lib"))
-from sk_common import HOME, cfg, claude_dir, make_logger, notify, run_configured, seed_config, short_path, state_dir  # noqa: E402
+from sk_common import HOME, cfg, cfg_number, claude_dir, make_logger, notify, run_configured, seed_config, short_path, state_dir  # noqa: E402
 
 _ld = SourceFileLoader("claude_iterm_restart", os.path.join(BIN, "claude-iterm-restart"))
 _sp = importlib.util.spec_from_loader("claude_iterm_restart", _ld)
@@ -54,6 +54,7 @@ _ld.exec_module(cir)
 
 STATE = state_dir()
 SAVE = os.path.join(STATE, "save.json")
+AUTO_PID = os.path.join(STATE, "auto.pid")  # "<pid> <start, epoch seconds>" of the --auto run in progress
 SHELLS = cir.SHELLS
 PRESENCE_VAR = "CLAUDE_CODE_DISABLE_NOTIFICATION_PRESENCE_CHECK"
 log = make_logger("claude-save.log")
@@ -643,6 +644,52 @@ def reopen(path, dry, force, newest=None):
     return 0
 
 
+def auto_begin(deadline):
+    """One --auto at a time, and none that lasts forever. launchd starts one every 5 minutes; when a
+    file open hangs (a stuck file provider, a full sandbox queue) a run never returns, and without
+    this each new run would hang too and pile up. False = this run must not start."""
+    now = time.time()
+    pid = started = None
+    try:
+        with open(AUTO_PID) as f:
+            p, s = f.read().split()
+        pid, started = int(p), float(s)
+    except (OSError, ValueError):
+        pass
+    if pid and pid != os.getpid():
+        if "claude-save" in proc_args(pid):
+            if now - started <= deadline:
+                return False  # the previous run is still inside its deadline
+            try:
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            except OSError:
+                pass
+            time.sleep(0.2)
+            gone = "claude-save" not in proc_args(pid)
+            log(f"auto: the run of {time.strftime('%H:%M:%S', time.localtime(started))} (pid {pid}) was alive after "
+                f"{deadline:g} s; " + ("stopped it" if gone else "it does not die, skipping this run"))
+            if not gone:
+                return False
+        else:
+            log(f"auto: the run of {time.strftime('%H:%M:%S', time.localtime(started))} did not finish "
+                f"(stopped at the {deadline:g} s deadline, or killed)")
+    os.makedirs(STATE, exist_ok=True)
+    with open(AUTO_PID, "w") as f:
+        f.write(f"{os.getpid()} {now}")
+    if hasattr(signal, "alarm"):  # not on Windows; there only the one-at-a-time check applies
+        signal.alarm(max(1, int(deadline)))  # default action: the process ends, even inside a blocked call
+    return True
+
+
+def auto_end():
+    if hasattr(signal, "alarm"):
+        signal.alarm(0)
+    try:
+        os.remove(AUTO_PID)
+    except OSError:
+        pass
+
+
 def main():
     a = sys.argv[1:]
     if a[:1] and a[0] in ("-h", "--help", "help"):
@@ -685,7 +732,12 @@ def main():
             return 0  # hook: never get in the way of a session start
     if a == ["--auto"]:
         try:
-            return save(False, auto=True)
+            if not auto_begin(cfg_number("SESSION_KEEPER_AUTO_DEADLINE", 60)):
+                return 0
+            try:
+                return save(False, auto=True)
+            finally:
+                auto_end()
         except Exception:  # runs from launchd: errors go to the log, not the screen
             import traceback
             log("auto failed: " + traceback.format_exc().strip().replace("\n", " | ")[-600:])
