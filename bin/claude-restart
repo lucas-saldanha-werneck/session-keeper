@@ -71,6 +71,16 @@ hook_registered() {
   return 1
 }
 
+scrub_app_env() {  # same list as scrub_app_env() in lib/sk_common.py; SESSION_KEEPER_KEEP_ENV names stay
+  local v keep=" ${SESSION_KEEPER_KEEP_ENV:-CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS CLAUDE_CODE_DISABLE_NOTIFICATION_PRESENCE_CHECK} "
+  for v in $(compgen -e); do
+    case "$v" in
+      CLAUDE_CODE_*|CLAUDE_AGENT_SDK_*|CLAUDECODE|CLAUDE_PID|CLAUDE_PLUGIN_DATA|CLAUDE_PLUGIN_ROOT|CLAUDE_EFFORT|CLAUDE_PREVIEW_CLASSIFIER_FLOOR|CLAUDE_JOB_DIR)
+        [[ "$keep" == *" $v "* ]] || unset "$v" ;;
+    esac
+  done
+}
+
 open_resume() {  # $1 = folder, $2 = resume id
   local cmd q
   cmd="cd $(printf '%q' "$1") && claude --resume $2${EXTRA_ARGS:+ $EXTRA_ARGS}"
@@ -89,7 +99,9 @@ end tell" >/dev/null && return 0
     osascript -e "tell application \"Terminal\" to do script \"$q\"" >/dev/null && return 0
   fi
   if [[ -n "$TMUX_BIN" ]]; then
-    tmx new-session -d -s "claude-$(printf '%s' "$2" | cut -c1-8)" -c "$1" "$cmd" && return 0
+    # In a subshell without this session's variables: if this starts the tmux server, it must not keep
+    # them (every later pane would look like this session, e.g. an app session).
+    ( scrub_app_env; tmx new-session -d -s "claude-$(printf '%s' "$2" | cut -c1-8)" -c "$1" "$cmd" ) && return 0
   fi
   log "no terminal to reopen in; run it yourself: $cmd"
 }

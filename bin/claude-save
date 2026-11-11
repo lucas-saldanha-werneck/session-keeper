@@ -55,7 +55,7 @@ except ImportError:  # not Windows
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(BIN), "lib"))
-from sk_common import HOME, cfg, cfg_number, claude_dir, make_logger, notify, run_configured, seed_config, short_path, state_dir  # noqa: E402
+from sk_common import HOME, cfg, cfg_number, claude_dir, make_logger, notify, run_configured, seed_config, scrub_app_env, short_path, state_dir  # noqa: E402
 
 _ld = SourceFileLoader("claude_iterm_restart", os.path.join(BIN, "claude-iterm-restart"))
 _sp = importlib.util.spec_from_loader("claude_iterm_restart", _ld)
@@ -744,6 +744,7 @@ def auto_end():
 
 
 def main():
+    scrub_app_env()  # never hand the calling Claude session's variables to tmux or new sessions
     a = sys.argv[1:]
     if a[:1] and a[0] in ("-h", "--help", "help"):
         print(__doc__)

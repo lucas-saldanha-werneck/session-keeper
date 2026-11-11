@@ -23,7 +23,7 @@ Log: claude-iterm-restart.log in $SESSION_KEEPER_LOG_DIR (default ~/Library/Logs
 import collections, json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
-from sk_common import HOME, cfg, claude_dir, find_tmux, is_macos, make_logger, run, short_path, state_dir  # noqa: E402
+from sk_common import HOME, cfg, claude_dir, find_tmux, is_macos, make_logger, run, scrub_app_env, short_path, state_dir  # noqa: E402
 
 STATE_DIR = state_dir()
 SNAPSHOT = os.path.join(STATE_DIR, "snapshot.json")
@@ -428,6 +428,7 @@ def phase2():
 
 
 def main():
+    scrub_app_env()  # never hand the calling Claude session's variables to tmux or new sessions
     a = sys.argv[1:]
     if a[:1] and a[0] in ("-h", "--help", "help"):
         print(__doc__)

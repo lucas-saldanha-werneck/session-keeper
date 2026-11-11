@@ -291,6 +291,20 @@ class TestConfig(unittest.TestCase):
                 mock.patch.dict(os.environ, {"SESSION_KEEPER_GC_PREFIX": ""}):
             self.assertEqual(sk_common.cfg("SESSION_KEEPER_GC_PREFIX"), "file")
 
+    def test_scrub_app_env_removes_parent_session_vars(self):
+        env = {"CLAUDE_CODE_ENTRYPOINT": "claude-desktop", "CLAUDE_CODE_HOST_SESSION_ID": "local_x",
+               "CLAUDE_AGENT_SDK_VERSION": "1", "CLAUDECODE": "1", "CLAUDE_PID": "9",
+               "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1", "CLAUDE_REAL_BIN": "/x", "HOME_KEEP_ME": "y"}
+        with mock.patch.dict(os.environ, env), mock.patch.dict(sk_common._CONFIG, {}, clear=True):
+            os.environ.pop("SESSION_KEEPER_KEEP_ENV", None)
+            gone = sk_common.scrub_app_env()
+            self.assertIn("CLAUDE_CODE_ENTRYPOINT", gone)
+            for k in ("CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_AGENT_SDK_VERSION",
+                      "CLAUDECODE", "CLAUDE_PID"):
+                self.assertNotIn(k, os.environ)
+            for k in ("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "CLAUDE_REAL_BIN", "HOME_KEEP_ME"):
+                self.assertIn(k, os.environ)
+
     def test_run_missing_program_returns_127(self):
         r = sk_common.run(["definitely-not-a-program-sk"])
         self.assertEqual(r.returncode, 127)
