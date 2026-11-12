@@ -95,6 +95,35 @@ scrub_app_env() {  # same list as scrub_app_env() in lib/sk_common.py; SESSION_K
   done
 }
 
+is_claude_cmd() {  # $1 = a command line: the claude binary or the claude-auto-retry launcher
+  local first="${1%% *}"
+  [[ "${first##*/}" == claude || "$1" == *claude-auto-retry* ]]
+}
+
+claude_ancestor() {  # pid of the nearest `claude` above this process (the session whose hook runs), or empty
+  local a=$PPID c n=0
+  while [[ -n "$a" && "$a" != 0 && "$a" != 1 && $n -lt 25 ]]; do
+    c="$(ps -o args= -p "$a" 2>/dev/null || true)"
+    if is_claude_cmd "$c"; then printf '%s' "$a"; return 0; fi
+    a="$(ps -o ppid= -p "$a" 2>/dev/null | tr -d ' ')"; n=$((n + 1))
+  done
+}
+
+stop_claude_pid() {  # $1 = pid recorded for the session; stops it only if it still is a claude process
+  local p="$1" c i
+  [[ "$p" =~ ^[0-9]+$ && "$p" -gt 1 ]] || return 0
+  c="$(ps -o args= -p "$p" 2>/dev/null || true)"
+  is_claude_cmd "$c" || return 0
+  if [[ "${CLAUDE_RESTART_DRYRUN:-}" == "1" ]]; then log "DRYRUN would stop claude pid $p"; return 0; fi
+  kill -TERM "$p" 2>/dev/null || return 0
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    kill -0 "$p" 2>/dev/null || { log "fire: stopped claude pid $p"; return 0; }
+    sleep 0.5
+  done
+  kill -KILL "$p" 2>/dev/null || true
+  log "fire: claude pid $p did not stop in 10 s; killed it"
+}
+
 open_resume() {  # $1 = folder, $2 = resume id
   local cmd q
   cmd="cd $(printf '%q' "$1") && claude --resume $2${EXTRA_ARGS:+ $EXTRA_ARGS}"
@@ -156,11 +185,15 @@ for x in (d.get("session_id") or "", t):
       nohup "$SELF_BIN" --fire "$F" >/dev/null 2>&1 & disown
       break
     fi
-    # Kill the tmux session where THIS turn ended, and resume THIS transcript.
+    # Restart the tmux pane where THIS turn ended, and resume THIS transcript.
     if [[ -n "${TMUX_PANE:-}" ]]; then
       me="$(tmx display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null || true)"
-      if [[ -n "$me" ]]; then printf 'SESSION=%q\n' "$me" >> "$F"; fi
+      if [[ -n "$me" ]]; then printf 'SESSION=%q\nPANE=%q\n' "$me" "$TMUX_PANE" >> "$F"; fi
     fi
+    # The claude process of this turn: outside tmux it must be stopped before the session is reopened,
+    # or two copies of the same conversation would run.
+    cpid="$(claude_ancestor)"
+    if [[ -n "$cpid" ]]; then printf 'OLD_PID=%q\n' "$cpid" >> "$F"; fi
     printf 'RESUME_ID=%q\n' "$id" >> "$F"
     log "stop-hook: turn of $id ended; firing restart"
     nohup "$SELF_BIN" --fire "$F" >/dev/null 2>&1 & disown
@@ -172,7 +205,7 @@ fi
 # ===== internal: fire (kill and reopen) =====
 if [[ "${1:-}" == "--fire" ]]; then
   F="${2:-}"; [[ -f "$F" ]] || exit 0
-  SESSION=""; TARGET=""; RESUME_ID=""; MODE=""; HOST_SID=""; APP_PID=0; MAINLOG_POS=0
+  SESSION=""; PANE=""; TARGET=""; RESUME_ID=""; MODE=""; HOST_SID=""; APP_PID=0; MAINLOG_POS=0; OLD_PID=""
   # shellcheck disable=SC1090
   source "$F"; rm -f "$F"
   if [[ "$MODE" == app ]]; then
@@ -182,9 +215,12 @@ if [[ "${1:-}" == "--fire" ]]; then
   sleep "${CLAUDE_RESTART_FIRE_DELAY:-2}"
   # Preferred: restart INSIDE the same tmux pane with respawn-pane. The iTerm window stays attached to
   # the same tmux session and just shows the new Claude. No stale window left behind.
-  PANE=""
-  if [[ -n "$SESSION" ]] && tmx has-session -t "$SESSION" 2>/dev/null; then
-    PANE="$(tmx list-panes -s -t "$SESSION" -F '#{pane_id}' 2>/dev/null | head -1)"
+  # "=name": tmux matches the exact session, never another one whose name starts the same.
+  # The pane of the turn (from the Stop hook) when it still exists, else the session's first pane.
+  WANT="$PANE"; PANE=""
+  if [[ -n "$SESSION" ]] && tmx has-session -t "=$SESSION" 2>/dev/null; then
+    panes="$(tmx list-panes -s -t "=$SESSION" -F '#{pane_id}' 2>/dev/null || true)"
+    if [[ -n "$WANT" ]] && grep -qxF -- "$WANT" <<<"$panes"; then PANE="$WANT"; else PANE="$(head -1 <<<"$panes")"; fi
   fi
   if [[ -n "$PANE" ]]; then
     SH="${SHELL:-/bin/sh}"
@@ -210,8 +246,9 @@ if [[ "${1:-}" == "--fire" ]]; then
     fi
     log "fire: respawn-pane failed in $PANE; falling back to a new window"
   fi
-  # Fallback: the tmux session is gone -> kill what is left and open a new window.
-  if [[ -n "$SESSION" ]]; then tmx kill-session -t "$SESSION" 2>/dev/null || true; fi
+  # Fallback: the tmux session is gone (or there never was one) -> stop what is left and open a new window.
+  if [[ -n "$SESSION" ]]; then tmx kill-session -t "=$SESSION" 2>/dev/null || true; fi
+  stop_claude_pid "${OLD_PID:-}"
   log "fire: killed ${SESSION:-?}; reopening $RESUME_ID in $TARGET (new window)"
   [[ "${CLAUDE_RESTART_DRYRUN:-}" == "1" ]] || sleep 1
   open_resume "$TARGET" "$RESUME_ID"
@@ -234,7 +271,8 @@ if [[ "${1:-}" == "--watch" ]]; then
       (( told )) || log "watch: $id has not ended a turn in $mins min; no dialog on this system, still waiting (use --now or --cancel)"
       told=1; continue
     fi
-    ans="$(osascript -e "display dialog \"The Claude session in:\" & return & \"$TARGET\" & return & return & \"has not finished a turn in $mins min. It may be idle or on a long task.\" & return & return & \"Kill and reopen now?\" buttons {\"Cancel restart\", \"Wait longer\", \"Kill now\"} default button \"Wait longer\" with title \"claude-restart\" giving up after ${CLAUDE_RESTART_GIVEUP:-600}" 2>/dev/null || echo 'button returned:Wait longer')"
+    qt="${TARGET//\\/\\\\}"; qt="${qt//\"/\\\"}"   # escaped for an AppleScript string
+    ans="$(osascript -e "display dialog \"The Claude session in:\" & return & \"$qt\" & return & return & \"has not finished a turn in $mins min. It may be idle or on a long task.\" & return & return & \"Kill and reopen now?\" buttons {\"Cancel restart\", \"Wait longer\", \"Kill now\"} default button \"Wait longer\" with title \"claude-restart\" giving up after ${CLAUDE_RESTART_GIVEUP:-600}" 2>/dev/null || echo 'button returned:Wait longer')"
     case "$ans" in
       *"Kill now"*)
         F="$PEND/$id.firing"; mv "$M" "$F" 2>/dev/null || exit 0
@@ -373,7 +411,7 @@ while IFS='|' read -r name dir; do
   [[ "$rp" == "$TARGET" ]] || continue
   MATCHES=$((MATCHES + 1))
   [[ -z "$FIRST" ]] && FIRST="$name"
-  pp="$(tmx list-panes -s -t "$name" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  pp="$(tmx list-panes -s -t "=$name" -F '#{pane_pid}' 2>/dev/null | head -1)"
   if [[ -n "$pp" ]] && has_claude "$pp"; then
     LIVE=$((LIVE + 1))
     [[ -z "$SESSION" ]] && SESSION="$name"
@@ -396,7 +434,7 @@ fi
 # .jsonl" picks the wrong one when two sessions share a folder.
 RESUME_ID=""
 if [[ -n "$SESSION" ]] && command -v claude >/dev/null 2>&1; then
-  PP="$(tmx list-panes -s -t "$SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  PP="$(tmx list-panes -s -t "=$SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)"
   [[ -n "$PP" ]] && RESUME_ID="$(claude agents --json 2>/dev/null | python3 -c '
 import json, sys, subprocess
 pp = sys.argv[1]
@@ -423,6 +461,23 @@ if [[ -z "$RESUME_ID" ]]; then
 fi
 [[ -n "$RESUME_ID" && -f "$DIR/$RESUME_ID.jsonl" ]] || die "no .jsonl transcript in $DIR"
 AGE="$(date -r "$DIR/$RESUME_ID.jsonl" '+%Y-%m-%d %H:%M')"
+# No tmux session: find the live claude running this conversation, so the restart stops it before it
+# reopens (else a second copy of the same conversation would run). The Stop hook records it too.
+OLD_PID=""
+if [[ -z "$SESSION" ]] && command -v claude >/dev/null 2>&1; then
+  OLD_PID="$(claude agents --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit()
+d = d if isinstance(d, list) else d.get("agents", [])
+for a in d:
+    if a.get("sessionId") == sys.argv[1] and a.get("pid"):
+        print(a["pid"])
+        break
+' "$RESUME_ID" 2>/dev/null || true)"
+fi
 
 echo "FOLDER   : $TARGET"
 echo "SESSION  : ${SESSION:-(no tmux session open in this folder)}"
@@ -449,6 +504,7 @@ fi
   printf 'TARGET=%q\n'    "$TARGET"
   printf 'RESUME_ID=%q\n' "$RESUME_ID"
   printf 'CREATED=%q\n'   "$(date '+%F %T')"
+  if [[ -n "$OLD_PID" ]]; then printf 'OLD_PID=%q\n' "$OLD_PID"; fi
 } > "$M"
 
 if [[ "$NOW" == yes ]]; then

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """claude-tmux-gc - close empty "shell" tmux sessions left behind by Claude Code.
 
-An empty shell = a tmux session whose name starts with the prefix (default "claude-") that has NO live
-claude / claude-auto-retry process in any pane and NO client attached (attached=0). Idle time is
+An empty shell = a tmux session whose name starts with the prefix (default "claude-"), with NO client
+attached (attached=0), where every pane runs only an idle shell: no claude / claude-auto-retry process and
+no other program (a server, an editor, a build), counting the pane's own process. Shell prompt helpers
+(gitstatusd) do not count as work. Idle time is
 deliberately NOT used: a session waiting for a usage limit to reset is idle on purpose, but its
 claude process is alive. Sessions younger than 10 minutes are kept (claude may still be starting).
 
@@ -16,6 +18,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath
 from sk_common import cfg, find_tmux, make_logger, run  # noqa: E402
 
 MIN_AGE = 10 * 60
+SHELLS = ("zsh", "bash", "sh", "fish", "login", "dash", "ksh", "tcsh", "csh")
+HELPERS = ("gitstatusd",)  # started by the shell prompt (powerlevel10k), not work
+
+
+def prog_name(args):
+    return os.path.basename(args.split()[0].lstrip("-")) if args and args.strip() else ""
 log = make_logger("claude-tmux-gc.log")
 
 
@@ -42,10 +50,15 @@ def main(argv):
         args[int(p[0])] = p[2]
 
     def alive(pid):
-        stack = list(kids[pid])
+        """True when the pane (its own process or any below it) runs something other than an idle shell."""
+        stack = [pid]
         while stack:
             x = stack.pop()
-            if "claude" in args.get(x, ""):  # the claude binary or the claude-auto-retry launcher
+            a = args.get(x, "")
+            name = prog_name(a)
+            if "claude" in a:  # the claude binary or the claude-auto-retry launcher
+                return True
+            if a and name not in SHELLS and not name.startswith(HELPERS):
                 return True
             stack += kids[x]
         return False

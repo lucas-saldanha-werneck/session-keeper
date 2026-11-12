@@ -4,10 +4,12 @@ Config comes from, in order: the environment, then ~/.config/session-keeper/conf
 shell style, '#' comments). The file exists so launchd jobs, which do not see your shell profile,
 get the same settings.
 """
+import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 HOME = os.path.expanduser("~")
@@ -137,6 +139,24 @@ def find_tmux():
         if os.path.exists(c):
             return c
     return None
+
+
+def write_json(path, data):
+    """Write data as JSON to path atomically: a temp file of its own in the same folder, then os.replace.
+    Two writers at once never share a temp file, and a crash midway leaves the old file whole."""
+    folder = os.path.dirname(os.path.abspath(path))
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1, ensure_ascii=False)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def run(cmd, **kw):

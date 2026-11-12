@@ -20,11 +20,16 @@ wait_for() { local i; for i in $(seq 1 50); do grep -qF -- "$2" "$1" 2>/dev/null
 
 cat >"$FAKE/tmux" <<'EOF'
 #!/bin/bash
+# Targets like real tmux: "=name" matches exactly, a bare name also matches as a prefix.
 echo "$*" >>"$FAKE_DIR/tmux-calls"
 case "$1" in
   list-sessions) cat "$FAKE_DIR/tmux-sessions" 2>/dev/null ;;
-  has-session) grep -q "^$3|" "$FAKE_DIR/tmux-sessions" 2>/dev/null ;;
-  list-panes) awk -F'|' -v s="$4" -v f="$6" '$1==s { print (f ~ /pane_pid/ ? $3 : $2) }' "$FAKE_DIR/panes" ;;
+  has-session)
+    if [[ -z "${3:-}" ]]; then [[ -s "$FAKE_DIR/tmux-sessions" ]]; exit; fi   # no target: is a server up?
+    if [[ "$3" == =* ]]; then grep -q "^${3#=}|" "$FAKE_DIR/tmux-sessions" 2>/dev/null; else grep -q "^$3" "$FAKE_DIR/tmux-sessions" 2>/dev/null; fi ;;
+  list-panes) awk -F'|' -v s="$4" -v f="$6" 'BEGIN { x = substr(s, 1, 1) == "="; if (x) s = substr(s, 2) }
+      (x ? $1 == s : index($1, s) == 1) { print (f ~ /pane_pid/ ? $3 : $2) }' "$FAKE_DIR/panes" ;;
+  run-shell) shift; [[ "$1" == -b ]] && shift; sh -c "$1" ;;
   display-message) awk -F'|' -v p="$4" '$2==p { print $1 }' "$FAKE_DIR/panes" ;;
   *) exit 0 ;;
 esac
@@ -114,9 +119,45 @@ out="$("$R" --cancel "$T/proj" 2>&1)"
 has "--cancel removes it" "cancelled: 1" "$out"
 
 : >"$T/tmux-sessions"
+echo "[{\"pid\": 200, \"sessionId\": \"$OLD\"}]" >"$T/agents.json"   # the newest transcript is live in pid 200
 out="$("$R" "$T/proj" --yes --now 2>&1)"
 has "--now fires right away" "killing and reopening now" "$out"
 if wait_for "$LOG" "DRYRUN would open: cd"; then ok "no tmux session left: reopens in a new window"; else bad "fallback to a new window" "$(tail -3 "$LOG")"; fi
+has "--now without tmux stops the live Claude of that id first (SK-03)" "DRYRUN would stop claude pid 200" "$(cat "$LOG")"
+echo "[{\"pid\": 200, \"sessionId\": \"$SID\"}]" >"$T/agents.json"
+
+echo "== claude-restart audit fixes"
+PEND="$T/claude/restart-pending"
+# SK-03: the Stop hook of a Claude outside tmux records that Claude, and the restart stops it
+: >"$LOG"; : >"$T/tmux-sessions"
+printf '%s 300 bash\n300 1 /usr/local/bin/claude\n100 1 -zsh\n' "$$" >"$T/ps"
+printf 'SESSION=\nTARGET=%q\nRESUME_ID=%q\n' "$T/proj" "$SID" >"$PEND/$SID.marker"
+echo "{\"session_id\": \"$SID\"}" | "$R" --stop-hook
+if wait_for "$LOG" "DRYRUN would open"; then ok "SK-03: outside tmux the restart reopens"; else bad "SK-03 reopen" "$(cat "$LOG")"; fi
+has "SK-03: and stops the old Claude first (no second copy)" "DRYRUN would stop claude pid 300" "$(cat "$LOG")"
+printf '100 1 -zsh\n200 100 /usr/local/bin/claude --remote-control\n' >"$T/ps"
+# SK-05: the pane where the turn ended is restarted, not the first pane of the session
+: >"$LOG"; echo "work|$T/proj" >"$T/tmux-sessions"
+printf 'work|%%0|90\nwork|%%1|100\n' >"$T/panes"
+printf 'SESSION=\nTARGET=%q\nRESUME_ID=%q\n' "$T/proj" "$SID" >"$PEND/$SID.marker"
+echo "{\"session_id\": \"$SID\"}" | TMUX_PANE=%1 CLAUDE_AUTO_RETRY_LAUNCHER="$T/none.js" "$R" --stop-hook
+if wait_for "$LOG" "DRYRUN respawn"; then has "SK-05: respawns the pane of the turn" "DRYRUN respawn %1 (work)" "$(cat "$LOG")"; else bad "SK-05" "$(cat "$LOG")"; fi
+echo "work|%1|100" >"$T/panes"
+# SK-12: a session that is gone is not matched by prefix to another one
+: >"$LOG"; : >"$T/tmux-calls"; echo "work2|$T/proj" >"$T/tmux-sessions"; echo "work2|%5|500" >"$T/panes"
+printf 'SESSION=work\nTARGET=%q\nRESUME_ID=%q\n' "$T/proj" "$SID" >"$PEND/$SID.firing"
+"$R" --fire "$PEND/$SID.firing"
+hasnt "SK-12: does not restart the pane of work2" "DRYRUN respawn %5" "$(cat "$LOG")"
+has "SK-12: reopens in a new window instead" "DRYRUN would open" "$(cat "$LOG")"
+has "SK-12: tmux targets are exact" "kill-session -t =work" "$(cat "$T/tmux-calls")"
+echo "work|$T/proj" >"$T/tmux-sessions"; echo "work|%1|100" >"$T/panes"; : >"$T/tmux-sessions"
+# SK-13: a folder name with a quote reaches the dialog escaped
+: >"$T/calls"; Q="$T/it\"s here"
+printf 'TARGET=%q\nRESUME_ID=x\n' "$Q" >"$PEND/quote-test.marker"
+SESSION_KEEPER_ASSUME_MACOS=1 "$R" --watch quote-test 0 &
+wpid=$!
+wait_for "$T/calls" "display dialog"; rm -f "$PEND/quote-test.marker"; wait "$wpid" 2>/dev/null
+has "SK-13: the folder is escaped for AppleScript" 'it\"s here' "$(cat "$T/calls")"
 
 start=$(date +%s); echo '{}' | "$R" --stop-hook; [[ $(( $(date +%s) - start )) -le 1 ]] && ok "stop hook fast path with nothing scheduled" || bad "stop hook fast path"
 out="$("$R" --bogus 2>&1)"; rc=$?
@@ -149,8 +190,16 @@ UB="$T/home/.local/bin"; mkdir -p "$UB"; L2="$T/blogs"; B2="$L2/claude-boot-reop
 printf '#!/bin/bash\necho "$*" >>"$FAKE_DIR/notified"\n' >"$UB/notifier"
 printf '#!/bin/bash\necho "result=$SESSION_KEEPER_REOPEN_RESULT up=$SESSION_KEEPER_REOPEN_UP total=$SESSION_KEEPER_REOPEN_TOTAL"\n' >"$UB/boot-report"
 printf '#!/bin/bash\necho Darwin\n' >"$UB/uname"
-# fake osascript that, like iTerm, runs the reopen.command in the background
-printf '#!/bin/bash\nc="$(sed -n "s/.* -l \\(.*\\)\\"$/\\1/p" <<<"$2")"\n[ -n "$c" ] && (bash "$c" </dev/null >/dev/null 2>&1 &)\nexit 0\n' >"$UB/osascript"
+# fake osascript that, like iTerm, runs the window's command in the background: the text of
+# `command "..."`, AppleScript escapes undone, split like a shell line
+cat >"$T/osa-run" <<'EOF'
+#!/bin/bash
+c="$(sed -n 's/.*command "\(.*\)"$/\1/p' <<<"$2" | sed 's/\\\(.\)/\1/g')"
+[ -n "$c" ] && (sleep "${OSA_DELAY:-0}"; eval "$c" </dev/null >/dev/null 2>&1) >/dev/null 2>&1 &
+[ -n "${OSA_FAIL:-}" ] && { echo "$OSA_FAIL" >&2; exit 1; }
+exit 0
+EOF
+chmod +x "$T/osa-run"; cp "$T/osa-run" "$UB/osascript"
 chmod +x "$UB"/*
 mkdir -p "$T/iTerm.app"
 printf 'SESSION_KEEPER_POST_BOOT=boot-report\nSESSION_KEEPER_NOTIFY=notifier\n' >"$T/sk-config2"
@@ -169,6 +218,16 @@ SHELL=/bin/bash SESSION_KEEPER_CONFIG="$T/sk-config2" SESSION_KEEPER_ITERM_APP="
 [[ $rc -eq 1 ]] && ok "iTerm could not be opened: exit 1" || bad "iTerm could not be opened: exit 1" "rc=$rc"
 hasnt "and the post-boot command is skipped" "result=" "$(cat "$T/notified")"
 has "the failure goes to the notifier instead" "could not open iTerm after login" "$(cat "$T/notified")"
+
+echo "== claude-boot-reopen: spaces in the shell and state paths (SK-14)"
+mkdir -p "$T/my shell"; ln -sf /bin/bash "$T/my shell/bash"
+SPST="$T/st ate"; : >"$B2"
+cp "$T/osa-run" "$UB/osascript"; chmod +x "$UB/osascript"
+SHELL="$T/my shell/bash" SESSION_KEEPER_STATE_DIR="$SPST" SESSION_KEEPER_CONFIG="$T/none" SESSION_KEEPER_ITERM_APP="$T/iTerm.app" \
+  SESSION_KEEPER_LOG_DIR="$L2" CLAUDE_BOOT_REOPEN_DELAY=0 "$ROOT/bin/claude-boot-reopen"
+for _ in $(seq 1 100); do [[ -f "$SPST/reopen.result" ]] && break; sleep 0.1; done
+[[ -f "$SPST/reopen.result" ]] && ok "SK-14: the reopen window runs with spaces in the paths" || bad "SK-14: reopen with spaces" "$(tail -5 "$B2")"
+[[ "$(head -1 "$SPST/reopen.command")" == "#!/bin/sh" ]] && ok "SK-14: the reopen script is a /bin/sh script" || bad "SK-14 shebang" "$(head -1 "$SPST/reopen.command")"
 
 echo "== claude-boot-reopen: iTerm does not answer in time (the request stays in its queue)"
 boot2() { SHELL=/bin/bash SESSION_KEEPER_CONFIG="$T/sk-config2" SESSION_KEEPER_ITERM_APP="$T/iTerm.app" SESSION_KEEPER_LOG_DIR="$L2" \
@@ -192,7 +251,7 @@ CLAUDE_BOOT_ITERM_WAIT=5 CLAUDE_BOOT_ITERM_RESEND=2 boot2 "$ROOT/bin/claude-boot
 [[ "$(grep -c 'is not answering' "$T/notified")" == 1 ]] && ok "but the notifier hears about it once" || bad "but the notifier hears about it once" "$(cat "$T/notified")"
 # fake osascript: times out, and iTerm runs the queued command a moment later
 : >"$T/notified"; : >"$B2"; : >"$T/osa-calls"
-printf '#!/bin/bash\necho x >>"%s"\nc="$(sed -n "s/.* -l \\(.*\\)\\"$/\\1/p" <<<"$2")"\n(sleep 1; bash "$c" </dev/null >/dev/null 2>&1 &) >/dev/null 2>&1 &\necho "execution error: AppleEvent timed out. (-1712)" >&2\nexit 1\n' "$T/osa-calls" >"$UB/osascript"; chmod +x "$UB/osascript"
+{ echo '#!/bin/bash'; echo "echo x >>'$T/osa-calls'"; echo "OSA_DELAY=1 OSA_FAIL='execution error: AppleEvent timed out. (-1712)' exec '$T/osa-run' \"\$@\""; } >"$UB/osascript"; chmod +x "$UB/osascript"
 CLAUDE_BOOT_ITERM_WAIT=20 SESSION_KEEPER_POST_BOOT_WAIT=30 boot2 "$ROOT/bin/claude-boot-reopen"; rc=$?
 [[ $rc -eq 0 && "$(wc -l <"$T/osa-calls" | tr -d ' ')" == 1 ]] && ok "late answer: one request, and the boot goes on" || bad "late answer" "rc=$rc calls=$(wc -l <"$T/osa-calls") $(cat "$B2")"
 has "the late start is logged" "iTerm ran the request" "$(cat "$B2")"
@@ -201,7 +260,7 @@ has "post-boot still gets the result" "result=failed" "$(cat "$T/notified")"
 echo "== claude-boot-reopen: a duplicate reopen window (claude-save exits 3) leaves no result"
 FK="$T/fk"; mkdir -p "$FK/bin" "$FK/lib"; cp "$ROOT/bin/claude-boot-reopen" "$FK/bin/"; cp "$ROOT/lib/sk_config.sh" "$FK/lib/"
 printf '#!/bin/bash\ncase "$1" in --reopen) echo "another claude-save --reopen is running: nothing opened here"; exit 3 ;; --post-boot) echo "result=$SESSION_KEEPER_REOPEN_RESULT" >>"%s" ;; esac\nexit 0\n' "$T/notified" >"$FK/bin/claude-save"; chmod +x "$FK/bin/claude-save"
-printf '#!/bin/bash\nc="$(sed -n "s/.* -l \\(.*\\)\\"$/\\1/p" <<<"$2")"\n[ -n "$c" ] && (bash "$c" </dev/null >/dev/null 2>&1 &)\nexit 0\n' >"$UB/osascript"; chmod +x "$UB/osascript"
+cp "$T/osa-run" "$UB/osascript"; chmod +x "$UB/osascript"
 : >"$T/notified"; : >"$B2"
 SESSION_KEEPER_POST_BOOT_WAIT=4 boot2 "$FK/bin/claude-boot-reopen"
 has "the duplicate is logged" "duplicate reopen request" "$(cat "$B2")"
@@ -282,7 +341,7 @@ for l in autosave tmux-gc boot-reopen; do
   if python3 -c 'import plistlib,sys; d=plistlib.load(open(sys.argv[1],"rb")); assert d["Label"]==sys.argv[2]' "$f" "org.example.sk.$l" 2>/dev/null; then
     ok "plist $l is valid and labelled"; else bad "plist $l"; fi
 done
-has "autosave goes through tmux" "<string>$FAKE/tmux</string>" "$(cat "$A/org.example.sk.autosave.plist")"
+has "autosave goes through tmux" "$FAKE/tmux run-shell -b" "$(cat "$A/org.example.sk.autosave.plist")"
 has "plists use the real home" "$T/home/.local/share/session-keeper/bin/claude-boot-reopen" "$(cat "$A/org.example.sk.boot-reopen.plist")"
 calls="$(cat "$T/calls")"
 has "autosave job started" "launchctl bootstrap gui/$(id -u) $A/org.example.sk.autosave.plist" "$calls"
@@ -295,6 +354,30 @@ out="$(SESSION_KEEPER_INSTALL_OS=Darwin "$ROOT/install.sh" --uninstall --prefix 
   && ok "--uninstall removes commands, plists and the copy" || bad "--uninstall"
 [[ -f "$T/home/.local/bin/claude-tmux-gc.keep" ]] && ok "--uninstall leaves other files" || bad "--uninstall leaves other files"
 has "--uninstall stops the jobs" "launchctl bootout gui/$(id -u)/org.example.sk.autosave" "$(cat "$T/calls")"
+
+echo "== install.sh audit fixes"
+SH2="$T/share dir/sk"; : >"$T/tmux-sessions"
+SESSION_KEEPER_SHARE_DIR="$SH2" SESSION_KEEPER_INSTALL_OS=Darwin "$ROOT/install.sh" --prefix org.example.sk2 --bin-dir "$T/bin2" >/dev/null 2>&1
+cat >"$SH2/bin/claude-save" <<EOF
+#!/usr/bin/env python3
+import sys
+open("$T/autosave-ran", "a").write(" ".join(sys.argv[1:]) + "\\n")
+EOF
+runplist() { python3 -c 'import plistlib, subprocess, sys; subprocess.run(plistlib.load(open(sys.argv[1], "rb"))["ProgramArguments"])' "$1"; }
+rm -f "$T/autosave-ran"
+runplist "$A/org.example.sk2.autosave.plist"
+has "SK-01: autosave runs without a tmux server" "--auto" "$(cat "$T/autosave-ran" 2>/dev/null)"
+rm -f "$T/autosave-ran"; : >"$T/tmux-calls"; echo "work|$T/proj" >"$T/tmux-sessions"
+runplist "$A/org.example.sk2.autosave.plist"
+has "SK-15: through tmux run-shell, a share folder with a space works" "--auto" "$(cat "$T/autosave-ran" 2>/dev/null)"
+has "SK-01: and it went through tmux when a server is up" "run-shell -b" "$(cat "$T/tmux-calls")"
+: >"$T/tmux-sessions"
+SESSION_KEEPER_SHARE_DIR="$SH2" SESSION_KEEPER_INSTALL_OS=Darwin "$ROOT/install.sh" --uninstall --prefix org.example.sk2 --bin-dir "$T/bin2" >/dev/null 2>&1
+[[ ! -e "$SH2" && -d "$T/share dir" ]] && ok "SK-19: --uninstall removes its own copy" || bad "SK-19: own copy" "$(ls -R "$T/share dir")"
+mkdir -p "$T/precious/bin"; echo keep >"$T/precious/keep.txt"
+out="$(SESSION_KEEPER_SHARE_DIR="$T/precious" SESSION_KEEPER_INSTALL_OS=Darwin "$ROOT/install.sh" --uninstall --prefix org.example.sk3 2>&1)"
+[[ -f "$T/precious/keep.txt" ]] && ok "SK-19: --uninstall never deletes a folder that is not an install" || bad "SK-19: deleted a foreign folder"
+has "SK-19: and says why" "does not look like a session-keeper install" "$out"
 
 echo "mine" >"$T/home/.local/bin/claude-save"
 out="$(SESSION_KEEPER_INSTALL_OS=Linux "$ROOT/install.sh" 2>&1)"

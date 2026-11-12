@@ -8,7 +8,8 @@ Usage:
                                      overwrite a pre-boot save that has not been reopened yet
   claude-save --warn                 SessionStart hook: warns when --auto is paused waiting for --reopen
   claude-save --reopen               AFTER restarting (in an iTerm window): reopen everything. One at a
-                                     time: a --reopen started while another one runs opens nothing (exit 3)
+                                     time: a --reopen started while another one runs opens nothing (exit 3).
+                                     Exit 1 when no conversation came back: the save stays unmarked
   claude-save --reopen --dry-run     show the plan without opening anything
   claude-save --reopen --force       reopen a save that was already restored
   claude-save --reopen --keep-window do not close the window --reopen was run from
@@ -55,7 +56,7 @@ except ImportError:  # not Windows
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(BIN), "lib"))
-from sk_common import HOME, cfg, cfg_number, claude_dir, make_logger, notify, run_configured, seed_config, scrub_app_env, short_path, state_dir  # noqa: E402
+from sk_common import HOME, cfg, cfg_number, claude_dir, is_macos, make_logger, notify, run_configured, seed_config, scrub_app_env, short_path, state_dir, write_json  # noqa: E402
 
 _ld = SourceFileLoader("claude_iterm_restart", os.path.join(BIN, "claude-iterm-restart"))
 _sp = importlib.util.spec_from_loader("claude_iterm_restart", _ld)
@@ -64,6 +65,7 @@ _ld.exec_module(cir)
 
 STATE = state_dir()
 SAVE = os.path.join(STATE, "save.json")
+BOOT_SEEN = os.path.join(STATE, "boot.seen")  # "<boot id> <epoch>": when this boot was first seen
 AUTO_PID = os.path.join(STATE, "auto.pid")  # "<pid> <start, epoch seconds>" of the --auto run in progress
 REOPEN_LOCK = os.path.join(STATE, "reopen.lock")  # held (OS file lock) by the --reopen in progress
 REOPEN_DONE = os.path.join(STATE, "reopen.done")  # "<up> <total>" of the last --reopen that marked a save
@@ -130,6 +132,16 @@ def proc_env(pid):
 
 def proc_args(pid):
     return run(["ps", "-ww", "-p", str(pid), "-o", "args="]).stdout.strip()
+
+
+def proc_started(pid):
+    """Start time of a process (epoch seconds), from ps etime ([[dd-]hh:]mm:ss); None if unknown."""
+    text = run(["ps", "-p", str(pid), "-o", "etime="]).stdout.strip()
+    m = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)", text)
+    if not m:
+        return None
+    d, h, mi, se = (int(x or 0) for x in m.groups())
+    return time.time() - (((d * 24 + h) * 60 + mi) * 60 + se)
 
 
 def my_ancestors():
@@ -230,15 +242,46 @@ def describe(x):
 def my_tty():
     try:
         return os.ttyname(sys.stdin.fileno())
-    except OSError:
+    except (OSError, AttributeError, ValueError):  # no ttyname on Windows
         return None
 
 
 # ---------- save ----------
 
+def boot_id():
+    """An id that changes with every boot (macOS kern.bootsessionuuid, Linux boot_id); None if unknown."""
+    if is_macos():
+        r = run(["sysctl", "-n", "kern.bootsessionuuid"])
+        return r.stdout.strip() or None if r.returncode == 0 else None
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def boot_seen_at(bid):
+    """When this boot was first seen by claude-save (stands for the boot time in the 24 h rule)."""
+    try:
+        with open(BOOT_SEEN) as f:
+            seen, at = f.read().split()
+        if seen == bid:
+            return float(at)
+    except (OSError, ValueError):
+        pass
+    now = time.time()
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with open(BOOT_SEEN, "w") as f:
+            f.write(f"{bid} {now}")
+    except OSError:
+        pass
+    return now
+
+
 def tmux_started_at():
-    """When the tmux server started. A reboot = a new tmux server. kern.boottime is NOT used: macOS
-    moves it forward when the Mac sleeps, which blocked --auto for a whole day without a reboot."""
+    """When the tmux server started: the reboot signal for saves without a boot id. kern.boottime is NOT
+    used: macOS moves it forward when the Mac sleeps, which blocked --auto for a whole day without a reboot."""
     r = run([tmux(), "display-message", "-p", "#{start_time}"])
     try:
         return int(r.stdout.strip())
@@ -261,9 +304,15 @@ def paused():
             old = json.load(f)
     except Exception:
         return None
-    boot = tmux_started_at()
+    bid = boot_id()
+    if bid and old.get("boot_id"):
+        # the boot id tells a reboot apart from a tmux server that only restarted, and works without tmux
+        rebooted, boot = bid != old["boot_id"], boot_seen_at(bid)
+    else:  # no boot id (a save from before 0.2.8, or none on this system): a newer tmux server = a reboot
+        boot = tmux_started_at()
+        rebooted = old["saved_at"] < boot
     # 24 h without reopening = the save was abandoned; saving resumes (old copies stay in save-*.json)
-    if old["saved_at"] < boot and not old.get("restored_at") and time.time() - boot <= 24 * 3600:
+    if rebooted and not old.get("restored_at") and time.time() - boot <= 24 * 3600:
         return old, boot
     return None
 
@@ -302,7 +351,7 @@ def auto_may_save():
         except OSError:
             seen = ""
         if seen != str(old["saved_at"]):
-            log(f"auto: paused until --reopen - the save from {old.get('when')} is older than the tmux server "
+            log(f"auto: paused until --reopen - the save from {old.get('when')} was made before the restart "
                 f"({time.strftime('%Y-%m-%d %H:%M', time.localtime(boot))})")
             os.makedirs(STATE, exist_ok=True)
             with open(mark, "w") as f:
@@ -341,7 +390,7 @@ def save(dry, auto=False):
         preflight("SESSION_KEEPER_PRE_SAVE", "saving")
     live = live_sessions()
     me = my_ancestors()
-    snap = cir.take_snapshot()
+    snap = cir.take_snapshot(write=not dry)  # a dry run leaves claude-iterm-restart's snapshot alone
     # iTerm installed but closed, or osascript failed: a partial snapshot would erase the windows from
     # the save. Without iTerm at all there are no windows to lose, so saving the tmux sessions is fine.
     if auto and snap is None and cir.iterm_installed():
@@ -387,7 +436,7 @@ def save(dry, auto=False):
             detached.append({"session": name, "cwd": panes[0][1] if panes else HOME, "command": com})
 
     busy = [x for x in windows + detached if x.get("status") == "busy" and x.get("pid") not in me]
-    data = {"saved_at": time.time(), "when": time.strftime("%Y-%m-%d %H:%M:%S"),
+    data = {"saved_at": time.time(), "when": time.strftime("%Y-%m-%d %H:%M:%S"), "boot_id": boot_id(),
             "windows": windows, "detached": detached, "restored_at": None}
     history = True
     if auto:
@@ -424,11 +473,7 @@ def save(dry, auto=False):
 
 
 def write(data, history, msg):
-    os.makedirs(STATE, exist_ok=True)
-    tmp = SAVE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=1, ensure_ascii=False)
-    os.replace(tmp, SAVE)
+    write_json(SAVE, data)  # a temp file of its own: a manual save and --auto at once do not collide
     if history:  # dated copies: only the last 10
         stamp = time.strftime("%Y%m%d-%H%M%S")
         path = os.path.join(STATE, f"save-{stamp}.json")
@@ -436,8 +481,7 @@ def write(data, history, msg):
         while os.path.exists(path):
             path = os.path.join(STATE, f"save-{stamp}-{n}.json")
             n += 1
-        with open(path, "w") as f:
-            json.dump(data, f, indent=1, ensure_ascii=False)
+        write_json(path, data)
         for old in sorted(glob.glob(os.path.join(STATE, "save-*.json")))[:-10]:
             os.remove(old)
     log(msg)
@@ -630,15 +674,15 @@ def reopen(path, dry, force, newest=None):
             break
         time.sleep(0.5)
     missing = [i for i in waiting if i not in live]
-    marked = not error or len(missing) < len(waiting)  # error and nothing up = leave the save for another --reopen
+    # Nothing came back (an error, or every conversation failed to resume) = leave the save unmarked, so
+    # --auto keeps it and another --reopen can try again. A save with no conversation is simply done.
+    marked = not waiting or len(missing) < len(waiting)
     if marked:
         data["restored_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        with open(path, "w") as f:
-            json.dump(data, f, indent=1, ensure_ascii=False)
+        write_json(path, data)  # atomic: a crash here must not leave the save empty
         if newest:  # unblocks --auto, which looks at save.json
             newest["restored_at"] = data["restored_at"]
-            with open(SAVE, "w") as f:
-                json.dump(newest, f, indent=1, ensure_ascii=False)
+            write_json(SAVE, newest)
         # for claude-boot-reopen: a reopen request that iTerm runs late sees that one finished after login
         with open(REOPEN_DONE, "w") as f:
             f.write(f"{len(waiting) - len(missing)} {len(waiting)}\n")
@@ -657,7 +701,7 @@ def reopen(path, dry, force, newest=None):
                + ("" if marked else "\nNothing was marked as restored: run claude-save --reopen again."), log)
     if "--keep-window" not in sys.argv:
         close_caller_window(tty)
-    return 0
+    return 0 if marked else 1
 
 
 def reopen_begin():
@@ -710,7 +754,12 @@ def auto_begin(deadline):
     except (OSError, ValueError):
         pass
     if pid and pid != os.getpid():
-        if "claude-save" in proc_args(pid):
+        begun = proc_started(pid)
+        if begun is not None and begun > started + 5:
+            # the pid now belongs to a process started after that run: the run is gone, the pid was reused
+            log(f"auto: the run of {time.strftime('%H:%M:%S', time.localtime(started))} (pid {pid}) is gone; "
+                f"the pid was reused, leaving that process alone")
+        elif "claude-save" in proc_args(pid):
             if now - started <= deadline:
                 return False  # the previous run is still inside its deadline
             try:
