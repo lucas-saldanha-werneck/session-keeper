@@ -118,6 +118,16 @@ wait_for "$LOG" "DRYRUN respawn" ; has "uses the claude-auto-retry launcher when
 out="$("$R" --cancel "$T/proj" 2>&1)"
 has "--cancel removes it" "cancelled: 1" "$out"
 
+# a reader that closes the pipe after the first line must not stop the scheduling (12/11/2026: died by SIGPIPE)
+"$R" "$T/proj" --yes 2>&1 | head -1 >/dev/null; rc=${PIPESTATUS[0]}
+[[ -f "$T/claude/restart-pending/$SID.marker" && $rc -eq 0 ]] && ok "--yes | head -1 still schedules" \
+  || bad "--yes | head -1 still schedules" "rc=$rc, marker missing"
+"$R" --cancel "$T/proj" >/dev/null 2>&1
+( trap '' PIPE; "$R" "$T/proj" --yes 2>&1 | head -1 >/dev/null; exit "${PIPESTATUS[0]}" ); rc=$?
+[[ -f "$T/claude/restart-pending/$SID.marker" && $rc -eq 0 ]] && ok "--yes | head -1 with SIGPIPE ignored still schedules" \
+  || bad "--yes | head -1 with SIGPIPE ignored still schedules" "rc=$rc, marker missing"
+"$R" --cancel "$T/proj" >/dev/null 2>&1
+
 : >"$T/tmux-sessions"
 echo "[{\"pid\": 200, \"sessionId\": \"$OLD\"}]" >"$T/agents.json"   # the newest transcript is live in pid 200
 out="$("$R" "$T/proj" --yes --now 2>&1)"

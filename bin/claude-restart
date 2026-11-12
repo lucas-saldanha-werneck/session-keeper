@@ -62,6 +62,11 @@ tmx() { [[ -n "$TMUX_BIN" ]] || return 127; "$TMUX_BIN" "$@"; }
 
 die() { printf 'claude-restart: %s\n' "$1" >&2; exit 1; }
 log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
+# Output of the user-facing modes. Never fails: a reader that stops early (`claude-restart --yes | head -1`)
+# must not abort the run before the marker is written (with SIGPIPE ignored, a failed echo trips set -e).
+say() { printf '%s\n' "$*" 2>/dev/null || true; }
+# Start this script in the background, with SIGPIPE back to default (the user-facing modes ignore it).
+bg_self() { ( trap - PIPE; exec nohup "$SELF_BIN" "$@" >/dev/null 2>&1 ) & disown; }
 file_size() { stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null || echo 0; }
 is_macos() { [[ "$(uname -s)" == Darwin || "${SESSION_KEEPER_ASSUME_MACOS:-}" == 1 ]]; }
 
@@ -326,6 +331,9 @@ done
 TARGET="${TARGET:-$PWD}"
 [[ -d "$TARGET" ]] || die "folder does not exist: $TARGET"
 TARGET="$(cd "$TARGET" && pwd -P)"
+# From here on, output goes through say(): a closed stdout/stderr (`| head -1`) must not kill the run by
+# SIGPIPE half-way, before the marker exists (seen 12/11/2026: printed FOLDER, scheduled nothing).
+trap '' PIPE
 
 if [[ "$CANCEL" == yes ]]; then
   n=0; want="TARGET=$(printf '%q' "$TARGET")"
@@ -334,7 +342,7 @@ if [[ "$CANCEL" == yes ]]; then
     if grep -qxF "$want" "$M"; then rm -f "$M"; n=$((n + 1)); fi
   done
   log "cancel: $n marker(s) removed for $TARGET"
-  echo "cancelled: $n scheduled restart(s) for $TARGET"
+  say "cancelled: $n scheduled restart(s) for $TARGET"
   exit 0
 fi
 
@@ -347,22 +355,22 @@ SLUG="$(printf '%s' "$TARGET" | sed 's#[^A-Za-z0-9]#-#g')"
 DIR="$PROJ_ROOT/$SLUG"
 if [[ "${CLAUDE_CODE_ENTRYPOINT:-}" == claude-desktop && "$APP_HOST" =~ ^local_[0-9a-f-]{36}$ \
       && -n "$APP_SID" && -f "$DIR/$APP_SID.jsonl" ]] && ! under_terminal; then
-  echo "FOLDER   : $TARGET"
-  echo "SESSION  : desktop app $APP_HOST"
-  echo "RESUME ID: $APP_SID   (last write: $(date -r "$DIR/$APP_SID.jsonl" '+%Y-%m-%d %H:%M'))"
-  hook_registered || echo "WARNING: the Stop hook is NOT registered - a scheduled restart never fires." >&2
-  echo
+  say "FOLDER   : $TARGET"
+  say "SESSION  : desktop app $APP_HOST"
+  say "RESUME ID: $APP_SID   (last write: $(date -r "$DIR/$APP_SID.jsonl" '+%Y-%m-%d %H:%M'))"
+  hook_registered || say "WARNING: the Stop hook is NOT registered - a scheduled restart never fires." >&2
+  say
   if [[ "$CONFIRM" != yes ]]; then
-    echo "PLAN (nothing done - run again with --yes):"
-    echo "  1. wait for this session's turn to end (Stop hook)"
-    echo "  2. stop only this session's claude process (the app stays open)"
-    echo "  3. without touching the UI: the NEXT message starts a new process with --resume $APP_SID"
-    echo "  (--now skips the wait and kills right away)"
+    say "PLAN (nothing done - run again with --yes):"
+    say "  1. wait for this session's turn to end (Stop hook)"
+    say "  2. stop only this session's claude process (the app stays open)"
+    say "  3. without touching the UI: the NEXT message starts a new process with --resume $APP_SID"
+    say "  (--now skips the wait and kills right away)"
     exit 0
   fi
   M="$PEND/$APP_SID.marker"
   if [[ -f "$M" && "$NOW" != yes ]]; then
-    echo "Already scheduled for this session. See: claude-restart --pending"; exit 0
+    say "Already scheduled for this session. See: claude-restart --pending"; exit 0
   fi
   {
     printf 'MODE=app\n'
@@ -375,14 +383,14 @@ if [[ "${CLAUDE_CODE_ENTRYPOINT:-}" == claude-desktop && "$APP_HOST" =~ ^local_[
   if [[ "$NOW" == yes ]]; then
     F="$PEND/$APP_SID.firing"; mv "$M" "$F"
     log "now: app $APP_SID ($APP_HOST)"
-    nohup "$SELF_BIN" --fire "$F" >/dev/null 2>&1 & disown
-    echo "-> killing and reopening now (in ~3s)."; exit 0
+    bg_self --fire "$F"
+    say "-> killing and reopening now (in ~3s)."; exit 0
   fi
-  nohup "$SELF_BIN" --watch "$APP_SID" $(( WAITMIN * 60 )) >/dev/null 2>&1 & disown
+  bg_self --watch "$APP_SID" $(( WAITMIN * 60 ))
   log "scheduled: app $APP_SID ($APP_HOST), asks after ${WAITMIN} min"
-  echo "SCHEDULED. At the end of the turn this session's process stops. The next message starts the new one (~15 s)."
-  echo "If the turn does not end in $WAITMIN min, a dialog asks whether to kill."
-  echo "Cancel: claude-restart --cancel '$TARGET'"
+  say "SCHEDULED. At the end of the turn this session's process stops. The next message starts the new one (~15 s)."
+  say "If the turn does not end in $WAITMIN min, a dialog asks whether to kill."
+  say "Cancel: claude-restart --cancel '$TARGET'"
   exit 0
 fi
 
@@ -420,12 +428,12 @@ done < <(tmx list-sessions -F '#{session_name}|#{pane_current_path}' 2>/dev/null
 
 if [[ -z "$SESSION" && -n "$FIRST" ]]; then
   SESSION="$FIRST"
-  echo "WARNING: no session in this folder has a live Claude; using $FIRST (shell only)." >&2
+  say "WARNING: no session in this folder has a live Claude; using $FIRST (shell only)." >&2
 fi
 if (( LIVE > 1 )); then
-  echo "WARNING: $LIVE sessions with a live Claude in this folder. The resume id may belong to another one." >&2
+  say "WARNING: $LIVE sessions with a live Claude in this folder. The resume id may belong to another one." >&2
 elif (( MATCHES > 1 )); then
-  echo "WARNING: $MATCHES tmux sessions in this folder; picked the one with a live Claude: $SESSION" >&2
+  say "WARNING: $MATCHES tmux sessions in this folder; picked the one with a live Claude: $SESSION" >&2
 fi
 
 # ===== session id =====
@@ -457,7 +465,7 @@ fi
 if [[ -z "$RESUME_ID" ]]; then
   newest="$(ls -t "$DIR"/*.jsonl 2>/dev/null | head -1 || true)"
   [[ -n "$newest" ]] && RESUME_ID="$(basename "$newest" .jsonl)"
-  echo "WARNING: could not find the live Claude in the pane; using the folder's newest transcript." >&2
+  say "WARNING: could not find the live Claude in the pane; using the folder's newest transcript." >&2
 fi
 [[ -n "$RESUME_ID" && -f "$DIR/$RESUME_ID.jsonl" ]] || die "no .jsonl transcript in $DIR"
 AGE="$(date -r "$DIR/$RESUME_ID.jsonl" '+%Y-%m-%d %H:%M')"
@@ -479,24 +487,24 @@ for a in d:
 ' "$RESUME_ID" 2>/dev/null || true)"
 fi
 
-echo "FOLDER   : $TARGET"
-echo "SESSION  : ${SESSION:-(no tmux session open in this folder)}"
-echo "RESUME ID: $RESUME_ID   (last write: $AGE)"
-hook_registered || echo "WARNING: the Stop hook is NOT registered - a scheduled restart never fires." >&2
-echo
+say "FOLDER   : $TARGET"
+say "SESSION  : ${SESSION:-(no tmux session open in this folder)}"
+say "RESUME ID: $RESUME_ID   (last write: $AGE)"
+hook_registered || say "WARNING: the Stop hook is NOT registered - a scheduled restart never fires." >&2
+say
 
 if [[ "$CONFIRM" != yes ]]; then
-  echo "PLAN (nothing done - run again with --yes):"
-  echo "  1. wait for this session's turn to end (Stop hook)"
-  echo "  2. then close ${SESSION:-the session} and reopen with: claude --resume $RESUME_ID"
-  echo "  3. if the turn does not end in $WAITMIN min, a dialog asks whether to kill"
-  echo "  (--now skips the wait and kills right away)"
+  say "PLAN (nothing done - run again with --yes):"
+  say "  1. wait for this session's turn to end (Stop hook)"
+  say "  2. then close ${SESSION:-the session} and reopen with: claude --resume $RESUME_ID"
+  say "  3. if the turn does not end in $WAITMIN min, a dialog asks whether to kill"
+  say "  (--now skips the wait and kills right away)"
   exit 0
 fi
 
 M="$PEND/$RESUME_ID.marker"
 if [[ -f "$M" && "$NOW" != yes ]]; then
-  echo "Already scheduled for this session. See: claude-restart --pending"
+  say "Already scheduled for this session. See: claude-restart --pending"
   exit 0
 fi
 {
@@ -510,13 +518,13 @@ fi
 if [[ "$NOW" == yes ]]; then
   F="$PEND/$RESUME_ID.firing"; mv "$M" "$F"
   log "now: $RESUME_ID ($SESSION)"
-  nohup "$SELF_BIN" --fire "$F" >/dev/null 2>&1 & disown
-  echo "-> killing and reopening now (in ~2s)."
+  bg_self --fire "$F"
+  say "-> killing and reopening now (in ~2s)."
   exit 0
 fi
 
-nohup "$SELF_BIN" --watch "$RESUME_ID" $(( WAITMIN * 60 )) >/dev/null 2>&1 & disown
+bg_self --watch "$RESUME_ID" $(( WAITMIN * 60 ))
 log "scheduled: $RESUME_ID ($SESSION), asks after ${WAITMIN} min"
-echo "SCHEDULED. The session restarts when its turn ends."
-echo "If the turn does not end in $WAITMIN min, a dialog asks whether to kill."
-echo "Cancel: claude-restart --cancel '$TARGET'"
+say "SCHEDULED. The session restarts when its turn ends."
+say "If the turn does not end in $WAITMIN min, a dialog asks whether to kill."
+say "Cancel: claude-restart --cancel '$TARGET'"
