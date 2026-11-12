@@ -1,6 +1,6 @@
 {
   "name": "session-keeper",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "Restart your Mac, iTerm2 or one Claude Code session without losing windows or conversations.",
   "author": {
     "name": "Lucas Saldanha Werneck",
