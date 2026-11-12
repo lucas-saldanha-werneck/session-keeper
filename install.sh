@@ -46,7 +46,8 @@ done
 do_() {  # run, or print in --dry-run
   if (( DRY )); then printf 'would run:'; printf ' %q' "$@"; printf '\n'; else "$@"; fi
 }
-xml() { local s="$1"; s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"; printf '%s' "$s"; }
+# sed, not ${s//&/&amp;}: bash 5.2 reads "&" in a replacement as the matched text (patsub_replacement)
+xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 
 if [[ "$OS" == Darwin ]]; then LOGDIR="$HOME/Library/Logs"; else LOGDIR="$HOME/.local/state/session-keeper/logs"; fi
 TMUX_BIN="$(command -v tmux 2>/dev/null || true)"
@@ -75,7 +76,7 @@ if (( UNINSTALL )); then
     if [[ -f "$SHARE/bin/claude-save" && -f "$SHARE/lib/sk_common.py" ]]; then
       for c in "${CMDS[@]}"; do [[ -e "$SHARE/bin/$c" ]] && do_ rm -f "$SHARE/bin/$c"; done
       for f in lib/sk_common.py lib/sk_config.sh config.example; do [[ -e "$SHARE/$f" ]] && do_ rm -f "$SHARE/$f"; done
-      [[ -d "$SHARE/lib/__pycache__" ]] && do_ rm -rf "$SHARE/lib/__pycache__"
+      for d in "$SHARE/lib/__pycache__" "$SHARE/bin/__pycache__"; do [[ -d "$d" ]] && do_ rm -rf "$d"; done
       for d in "$SHARE/bin" "$SHARE/lib" "$SHARE"; do [[ -d "$d" ]] && { do_ rmdir "$d" 2>/dev/null || echo "kept $d: it holds other files" >&2; }; done
     else
       echo "not removing $SHARE: it does not look like a session-keeper install (no bin/claude-save and lib/sk_common.py)" >&2
