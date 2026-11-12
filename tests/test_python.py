@@ -84,6 +84,8 @@ class FakeSystem:
         self.screens = {}       # pane id -> text
         self.start_on_write = True
         self.never_start = set()
+        self.boot_id = None     # kern.bootsessionuuid; None = sysctl not available
+        self.visible_ids = None  # answer to "get id of (windows whose visible is true)"
 
     # helpers to build the world
     def proc(self, pid, ppid, args, tty="??", env=""):
@@ -121,6 +123,8 @@ class FakeSystem:
             return self._tmux(a)
         if prog == "osascript":
             return self._osa(a[1])
+        if prog == "sysctl":
+            return cp(cmd, 0, self.boot_id + "\n") if self.boot_id else cp(cmd, 1, "", "unknown oid")
         if prog == "notifier":
             return cp(cmd, 0, "sent")
         if prog == "user-cmd":  # stands for the user's own pre/post commands: `user-cmd <rc> <stdout>`
@@ -189,7 +193,11 @@ class FakeSystem:
         if "count windows" in script:
             return cp([], 0, "1")
         if "get id of (windows" in script:
-            return cp([], 0, "")
+            return cp([], 0, ", ".join(self.visible_ids or []))
+        if "sessions of t" in script:  # every session of every tab of one window
+            import re
+            wid = int(re.search(r"first window whose id is (\d+)", script).group(1))
+            return cp([], 0, "".join(f"{tty}\n" for w, b, t, tty in self.windows if w == wid))
         if "create window" in script or "create tab" in script:
             self.created.append(script)
             self._resume_started(script)
@@ -927,6 +935,151 @@ class TestSeedConfig(unittest.TestCase):
             outs.append(json.loads(r.stdout))
         self.assertEqual(outs[0], outs[1])
         self.assertGreater(len(outs[0][1]), 30)   # every option of the starter was checked
+
+
+class TestAuditFixes(Base):
+    """Fixes from the audit of 2026-11 (ids SK-xx)."""
+    make_save = TestReopen.make_save
+
+    def osa_calls(self, text):
+        return [c[2] for c in self.fs.calls if c[0] == "osascript" and text in c[2]]
+
+    def test_sk02_iterm_restart_refuses_with_a_program_outside_tmux(self):
+        self.world()
+        self.fs.proc(251, 250, "vim notes.txt", tty="ttys002")
+        rc, out = self.out(cir.main, argv=[])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("vim notes.txt", out)
+        self.assertFalse([c for c in self.fs.calls if "run-shell" in c])
+        rc, out = self.out(cir.main, argv=["--force"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue([c for c in self.fs.calls if "run-shell" in c])
+
+    def test_sk06_close_empty_checks_every_tab(self):
+        b = [0, 0, 100, 100]
+        self.fs.windows = [(103, b, 1, "/dev/ttys004"), (103, b, 2, "/dev/ttys005"), (104, b, 1, "/dev/ttys006")]
+        self.fs.visible_ids = ["103", "104"]
+        self.fs.proc(350, 1, "-zsh", tty="ttys004")
+        self.fs.proc(360, 1, "-zsh", tty="ttys005")
+        self.fs.proc(361, 360, "vim notes.txt", tty="ttys005")
+        self.fs.proc(370, 1, "-zsh", tty="ttys006")
+        cir._close_empty(set(), "test")
+        closes = self.osa_calls("close (first window")
+        self.assertTrue([c for c in closes if "104" in c], closes)
+        self.assertFalse([c for c in closes if "103" in c], closes)
+
+    def test_sk07_writes_do_not_share_a_fixed_temp_file(self):
+        self.world()
+        os.makedirs(save_mod.SAVE + ".tmp")        # another writer's temp file in the way
+        os.makedirs(cir.SNAPSHOT + ".tmp")
+        rc, out = self.out(save_mod.save, False)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.saved()["windows"]), 4)
+        self.assertTrue(os.path.isfile(cir.SNAPSHOT))
+
+    def test_sk08_reboot_is_told_by_the_boot_id_not_by_tmux(self):
+        self.world()
+        self.fs.boot_id = "BOOT-A"
+        self.out(save_mod.save, False, True)
+        first = self.saved()
+        self.assertEqual(first["boot_id"], "BOOT-A")
+        self.fs.tmux_start = int(time.time()) + 10                    # tmux server restarted, same boot
+        self.fs.claude(301, 1, SID_B, f"{HOME}/elsewhere", tty="ttys003")
+        self.out(save_mod.save, False, True)
+        second = self.saved()["saved_at"]
+        self.assertNotEqual(second, first["saved_at"])                 # not paused
+        self.fs.boot_id, self.fs.tmux_start = "BOOT-B", 0             # a real reboot, no tmux server
+        self.fs.claude(301, 1, SID_B, f"{HOME}/third", tty="ttys003")
+        self.out(save_mod.save, False, True)
+        self.assertEqual(self.saved()["saved_at"], second)             # paused
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": "zzz"}))):
+            rc, out = self.out(save_mod.warn_sessionstart)
+        self.assertIn("Auto-save PAUSED", out)
+
+    def test_sk09_reopen_with_nothing_back_is_not_marked(self):
+        self.make_save()
+        self.fs.never_start.update({SID_A, SID_B, SID_C})
+        os.environ["SESSION_KEEPER_NOTIFY"] = "notifier"
+        rc, out = self.out(save_mod.reopen, save_mod.SAVE, False, False, argv=["--reopen", "--keep-window"])
+        self.assertEqual(rc, 1, out)
+        self.assertFalse(self.saved().get("restored_at"))
+        sent = [c for c in self.fs.calls if c[0] == "notifier"]
+        self.assertIn("Nothing was marked as restored", sent[0][1])
+
+    def test_sk10_restored_mark_is_written_atomically(self):
+        self.make_save()
+        real = json.dump
+
+        def boom(obj, f, *a, **k):
+            if isinstance(obj, dict) and obj.get("restored_at") and "windows" in obj:
+                f.write("{")
+                raise OSError("disk full")
+            return real(obj, f, *a, **k)
+        with mock.patch("json.dump", boom), self.assertRaises(OSError):
+            self.out(save_mod.reopen, save_mod.SAVE, False, False, argv=["--reopen", "--keep-window"])
+        self.assertFalse(self.saved().get("restored_at"))               # still a whole, readable save
+
+    def test_sk11_phase2_reopens_after_an_error(self):
+        self.world()
+        cir.take_snapshot()
+        self.fs.iterm_running = False
+        for stop, upd in ((ProcessLookupError("gone"), None), (None, OSError("move failed"))):
+            with mock.patch.object(cir, "stop_claudes", side_effect=stop, return_value=True), \
+                    mock.patch.object(cir, "update_app", side_effect=upd), \
+                    mock.patch.object(cir, "reopen") as ro, mock.patch.object(sys, "argv", ["x", "--phase2", "--update"]):
+                cir.phase2()
+            ro.assert_called_once()
+
+    def test_sk16_busy_claude_is_not_killed(self):
+        self.world()
+        self.fs.claude(301, 1, SID_B, f"{HOME}/other", tty="ttys003", status="busy")
+        cir.take_snapshot()
+        kills = []
+        with mock.patch.object(cir.os, "kill", lambda pid, sig: kills.append(pid)):
+            rc = cir.phase2()
+        self.assertEqual(rc, 1)
+        self.assertEqual(kills, [])
+        self.assertFalse(self.osa_calls("quit"))
+
+    def test_sk17_dry_run_keeps_the_snapshot(self):
+        self.world()
+        os.makedirs(save_mod.STATE, exist_ok=True)
+        with open(cir.SNAPSHOT, "w") as f:
+            f.write('{"mine": 1}')
+        self.out(save_mod.save, True)
+        self.out(cir.main, argv=["--dry-run"])
+        with open(cir.SNAPSHOT) as f:
+            self.assertEqual(f.read(), '{"mine": 1}')
+
+    def test_sk18_auto_begin_does_not_kill_a_reused_pid(self):
+        os.makedirs(save_mod.STATE, exist_ok=True)
+        with open(save_mod.AUTO_PID, "w") as f:
+            f.write(f"4242 {time.time() - 300}")
+        killed = []
+        with mock.patch.object(save_mod, "proc_args", lambda pid: "python3 /x/claude-save --auto"), \
+                mock.patch.object(save_mod, "proc_started", lambda pid: time.time() - 5), \
+                mock.patch.object(save_mod.os, "kill", lambda pid, sig: killed.append(pid)), \
+                mock.patch.object(save_mod.signal, "alarm", create=True):
+            self.assertTrue(save_mod.auto_begin(60))
+            save_mod.auto_end()
+        self.assertEqual(killed, [])
+
+    def test_sk04_gc_keeps_sessions_with_work(self):
+        old = int(time.time()) - 3600
+        fs = self.fs
+        fs.sessions = {n: {"panes": [(p, "/x", f"%{p}")], "attached": "0", "created": old}
+                       for n, p in (("claude-direct", 60), ("claude-vim", 70), ("claude-node", 80),
+                                    ("claude-p10k", 90), ("claude-empty", 95))}
+        fs.proc(60, 1, f"claude --resume {SID_A}")                   # claude IS the pane process
+        fs.proc(70, 1, "-zsh")
+        fs.proc(71, 70, "vim notes.txt")
+        fs.proc(80, 1, "node server.js")
+        fs.proc(90, 1, "-zsh")
+        fs.proc(91, 90, "gitstatusd-darwin-arm64 -G v1.5.4")         # a prompt helper: still an idle shell
+        fs.proc(95, 1, "-zsh")
+        with mock.patch.object(gc_mod, "find_tmux", lambda: "tmux"):
+            self.out(gc_mod.main, [])
+        self.assertEqual(set(fs.sessions), {"claude-direct", "claude-vim", "claude-node"})
 
 
 if __name__ == "__main__":

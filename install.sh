@@ -3,15 +3,17 @@
 #
 #   ./install.sh                 install (copies to ~/.local/share/session-keeper, symlinks into ~/.local/bin)
 #   ./install.sh --dry-run       show what would be done, change nothing
-#   ./install.sh --uninstall     remove the commands and the launchd jobs (keeps your saves and config)
+#   ./install.sh --uninstall     remove the commands and the launchd jobs (keeps your saves and config;
+#                                removes the copy folder only when it holds a session-keeper install)
 #   ./install.sh --no-launchd    commands only, no launchd jobs
 #   ./install.sh --prefix P      launchd label prefix (default com.claude-tools.session-keeper)
 #   ./install.sh --bin-dir D     where the command symlinks go (default ~/.local/bin)
 #   ./install.sh --force         replace existing files in the bin dir that are not ours
 #
 # launchd jobs (macOS):
-#   <prefix>.autosave      claude-save --auto every 5 minutes (through tmux when tmux is installed:
-#                          tmux, started from iTerm, already has the Automation permission for iTerm)
+#   <prefix>.autosave      claude-save --auto every 5 minutes (through tmux when a tmux server is up:
+#                          tmux, started from iTerm, already has the Automation permission for iTerm;
+#                          directly when no tmux server runs)
 #   <prefix>.tmux-gc       claude-tmux-gc daily at 05:30 (only when tmux is installed)
 #   <prefix>.boot-reopen   claude-boot-reopen at login. Written but NOT started now (it would open
 #                          windows right away); launchd loads it at your next login.
@@ -67,7 +69,18 @@ if (( UNINSTALL )); then
     t="$BIN_DIR/$c"
     if [[ -L "$t" && "$(readlink "$t")" == "$SHARE/bin/$c" ]]; then do_ rm -f "$t"; fi
   done
-  [[ -d "$SHARE" ]] && do_ rm -rf "$SHARE"
+  # SHARE can come from SESSION_KEEPER_SHARE_DIR: never rm -rf it. Only the files install.sh copies are
+  # removed, and the folders only when that leaves them empty.
+  if [[ -d "$SHARE" ]]; then
+    if [[ -f "$SHARE/bin/claude-save" && -f "$SHARE/lib/sk_common.py" ]]; then
+      for c in "${CMDS[@]}"; do [[ -e "$SHARE/bin/$c" ]] && do_ rm -f "$SHARE/bin/$c"; done
+      for f in lib/sk_common.py lib/sk_config.sh config.example; do [[ -e "$SHARE/$f" ]] && do_ rm -f "$SHARE/$f"; done
+      [[ -d "$SHARE/lib/__pycache__" ]] && do_ rm -rf "$SHARE/lib/__pycache__"
+      for d in "$SHARE/bin" "$SHARE/lib" "$SHARE"; do [[ -d "$d" ]] && { do_ rmdir "$d" 2>/dev/null || echo "kept $d: it holds other files" >&2; }; done
+    else
+      echo "not removing $SHARE: it does not look like a session-keeper install (no bin/claude-save and lib/sk_common.py)" >&2
+    fi
+  fi
   echo "session-keeper removed. Kept: your saves (~/.local/state/session-keeper) and config (~/.config/session-keeper)."
   exit 0
 fi
@@ -125,9 +138,13 @@ load_job() {
 }
 
 if (( LAUNCHD )) && [[ "$OS" == Darwin ]]; then
-  SAVE_CMD="$SHARE/bin/claude-save --auto >/dev/null 2>&1 || true"
   if [[ -n "$TMUX_BIN" ]]; then
-    write_plist "$PREFIX.autosave" $'\t<key>StartInterval</key>\n\t<integer>300</integer>' "$TMUX_BIN" run-shell -b "$SAVE_CMD"
+    # Through tmux when a server is up (it has iTerm's Automation permission); `tmux run-shell` fails
+    # without a server, so then claude-save runs directly. Every path is shell-quoted (spaces are fine).
+    SAVE_CMD="$(printf '%q' "$SHARE/bin/claude-save") --auto >/dev/null 2>&1 || true"
+    T_="$(printf '%q' "$TMUX_BIN")"
+    JOB="if $T_ has-session 2>/dev/null; then exec $T_ run-shell -b $(printf '%q' "$SAVE_CMD"); else exec $(printf '%q' "$PY") $(printf '%q' "$SHARE/bin/claude-save") --auto; fi"
+    write_plist "$PREFIX.autosave" $'\t<key>StartInterval</key>\n\t<integer>300</integer>' /bin/sh -c "$JOB"
   else
     write_plist "$PREFIX.autosave" $'\t<key>StartInterval</key>\n\t<integer>300</integer>' "$PY" "$SHARE/bin/claude-save" --auto
   fi

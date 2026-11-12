@@ -88,29 +88,32 @@ fi
 
 (( DRY )) || sleep "${CLAUDE_BOOT_REOPEN_DELAY:-20}"   # let Finder and the Dock come up
 CMD="$ST/reopen.command"
+# The script is plain sh (whatever the login shell is: fish does not read sh syntax), and every path
+# in it is shell-quoted (%q), so spaces or quotes in HOME, the state folder or SHELL do no harm.
+q() { printf '%q' "$1"; }
 cat >"$CMD" <<EOF
-#!$SH -l
-: >"$STARTED"
-if [ -f "$EXPIRED" ]; then  # claude-boot-reopen gave up and said so: a request that runs now would surprise
-  echo "\$(date '+%F %T') reopen request ignored: iTerm ran it after claude-boot-reopen stopped waiting" >>"$LOG"
+#!/bin/sh
+: >$(q "$STARTED")
+if [ -f $(q "$EXPIRED") ]; then  # claude-boot-reopen gave up and said so: a request that runs now would surprise
+  echo "\$(date '+%F %T') reopen request ignored: iTerm ran it after claude-boot-reopen stopped waiting" >>$(q "$LOG")
   exit 0
 fi
-if [ "$DONE" -nt "$CMD" ]; then  # a --reopen (by hand, or an earlier request) already finished after this login
-  echo "\$(date '+%F %T') reopen request ignored: a reopen already finished after this login" >>"$LOG"
+if [ $(q "$DONE") -nt $(q "$CMD") ]; then  # a --reopen (by hand, or an earlier request) already finished after this login
+  echo "\$(date '+%F %T') reopen request ignored: a reopen already finished after this login" >>$(q "$LOG")
   exit 0
 fi
 echo "claude-boot-reopen: claude-save $ARG"
-{ "$BIN_DIR/claude-save" $ARG; echo \$? >"$RES.tmp.\$\$"; } 2>&1 | tee -a "$LOG" "$OUT"
-rc="\$(cat "$RES.tmp.\$\$" 2>/dev/null)"
+{ $(q "$BIN_DIR/claude-save") $ARG; echo \$? >$(q "$RES.tmp.")\$\$; } 2>&1 | tee -a $(q "$LOG") $(q "$OUT")
+rc="\$(cat $(q "$RES.tmp.")\$\$ 2>/dev/null)"
 if [ "\$rc" = 3 ]; then  # another --reopen is running: this window was a duplicate request
-  rm -f "$RES.tmp.\$\$"
-  echo "\$(date '+%F %T') duplicate reopen request: another one is running, nothing opened here" >>"$LOG"
+  rm -f $(q "$RES.tmp.")\$\$
+  echo "\$(date '+%F %T') duplicate reopen request: another one is running, nothing opened here" >>$(q "$LOG")
   exit 0
 fi
 # the first run to finish gives the result; a late duplicate ("already restored") does not replace it
-if [ -f "$RES" ]; then rm -f "$RES.tmp.\$\$"; else mv -f "$RES.tmp.\$\$" "$RES"; fi
-echo "\$(date '+%F %T') reopen finished" >>"$LOG"
-exec $SH -l
+if [ -f $(q "$RES") ]; then rm -f $(q "$RES.tmp.")\$\$; else mv -f $(q "$RES.tmp.")\$\$ $(q "$RES"); fi
+echo "\$(date '+%F %T') reopen finished" >>$(q "$LOG")
+exec $(q "$SH") -l
 EOF
 chmod +x "$CMD"
 # `open -a iTerm x.command` does not run the script; osascript from launchd does.
@@ -119,13 +122,17 @@ chmod +x "$CMD"
 # waits for the request to start, and only sends another every CLAUDE_BOOT_ITERM_RESEND s (in case iTerm
 # was quit and lost it). Requests that pile up are harmless: claude-save --reopen runs one at a time, and
 # the command above ignores a request that comes after a reopen finished or after this gave up.
+# What iTerm runs: the login shell (so its profile sets PATH and the rest, as before) starts /bin/sh on
+# the script. Quoted for the shell, then escaped for the AppleScript string.
+WINCMD="$(q "$SH") -l -c $(q "/bin/sh $(q "$CMD")")"
+WINCMD="${WINCMD//\\/\\\\}"; WINCMD="${WINCMD//\"/\\\"}"
 budget="${CLAUDE_BOOT_ITERM_WAIT:-1800}"; [[ "$budget" =~ ^[0-9]+$ ]] || budget=1800
 resend="${CLAUDE_BOOT_ITERM_RESEND:-300}"; [[ "$resend" =~ ^[0-9]+$ ]] || resend=300
 (( DRY )) && budget=0
 opened=0; expired=0; fails=0; told=0; t=0; t0=$SECONDS
 while :; do
   t=$((t + 1))
-  err="$(osascript -e "tell application \"iTerm\" to create window with default profile command \"$SH -l $CMD\"" 2>&1)"; orc=$?
+  err="$(osascript -e "tell application \"iTerm\" to create window with default profile command \"$WINCMD\"" 2>&1)"; orc=$?
   [[ -n "$err" ]] && echo "$err" >>"$LOG"
   if (( orc == 0 )); then
     echo "$(date '+%F %T') iTerm opened with $CMD (attempt $t)" >>"$LOG"; opened=1; break

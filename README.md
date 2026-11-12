@@ -11,10 +11,10 @@ id in each) and later reopens it all, with `claude --resume <id>` in the right p
 | Command | What it does |
 |---|---|
 | `claude-save` | Saves iTerm2 windows/tabs and tmux sessions with their Claude session ids. `--reopen` brings them back after a reboot. `--auto` (launchd, every 5 min) keeps the save fresh |
-| `claude-iterm-restart` | Quits and reopens iTerm2 with every window where it was. `--update` installs the newest iTerm2 while it is closed |
+| `claude-iterm-restart` | Quits and reopens iTerm2 with every window where it was. `--update` installs the newest iTerm2 while it is closed. It stops (unless `--force`) when a tab outside tmux runs a program such as vim or ssh, since quitting iTerm2 would end it |
 | `claude-restart` | Restarts one Claude Code session at the end of its current turn, so new settings, hooks, plugins or MCP servers load without losing the conversation |
 | `claude-boot-reopen` | Runs at login and calls `claude-save --reopen` in a new iTerm2 window |
-| `claude-tmux-gc` | Closes empty tmux sessions left behind by Claude (no Claude process, no client attached) |
+| `claude-tmux-gc` | Closes empty tmux sessions left behind by Claude (only an idle shell in every pane, no client attached) |
 | `claude-folder-title` | Optional hook that puts the folder at the start of each session title (`acme/api · billing export`) |
 
 ## Example
@@ -75,9 +75,10 @@ cd session-keeper
 and on macOS writes three launchd jobs (label prefix `com.claude-tools.session-keeper`, change it
 with `--prefix`):
 
-- `.autosave`: `claude-save --auto` every 5 minutes. It goes through `tmux run-shell` when tmux is
-  installed, because tmux started from iTerm2 already has the macOS Automation permission to talk
-  to iTerm2; a launchd job calling `osascript` directly can hang on that permission prompt.
+- `.autosave`: `claude-save --auto` every 5 minutes. It goes through `tmux run-shell` when a tmux
+  server is running, because tmux started from iTerm2 already has the macOS Automation permission to
+  talk to iTerm2; a launchd job calling `osascript` directly can hang on that permission prompt. With
+  no tmux server it runs `claude-save --auto` directly (its own deadline stops a hung run).
 - `.tmux-gc`: `claude-tmux-gc` daily at 05:30 (only when tmux is installed).
 - `.boot-reopen`: `claude-boot-reopen` at login. It is written but not started during install;
   launchd loads it at your next login.
@@ -201,9 +202,11 @@ Python unit tests run there in CI.
   to its iTerm2 tab (by tty) or tmux pane (by process tree).
 - iTerm2 is driven with AppleScript (`osascript`): list windows, create windows and tabs at the saved
   bounds, write the command into the new session.
-- `claude-save --auto` does not overwrite a save made before the tmux server started (a reboot)
-  until it has been reopened, so the Mac starting empty cannot erase the good save. After 24 hours
-  the old save is treated as abandoned.
+- `claude-save --auto` does not overwrite a save made before a reboot until it has been reopened, so
+  the Mac starting empty cannot erase the good save. A reboot is told by the boot id
+  (`kern.bootsessionuuid` on macOS, `boot_id` on Linux) stored in the save; saves without one fall back
+  to "the tmux server started after the save". After 24 hours the old save is treated as abandoned.
+  A `--reopen` where no conversation came back leaves the save unmarked (exit 1), so it can be retried.
 - One `claude-save --auto` runs at a time, and it ends itself after `SESSION_KEEPER_AUTO_DEADLINE`
   seconds. When a file open hangs (a stuck file provider, for example), the runs that launchd starts
   every 5 minutes do not pile up: the next one stops the hung run, or skips if it cannot.
@@ -215,6 +218,9 @@ Python unit tests run there in CI.
   conversations.
 - `claude-iterm-restart` runs its second half from `tmux run-shell -b` (or a detached process) so it
   survives iTerm2 quitting. It turns off iTerm2's two quit prompts for the quit and puts them back.
+  It waits up to 10 minutes for every Claude outside tmux to be idle; if one is still working, it
+  closes nothing and cancels the restart (log and `SESSION_KEEPER_NOTIFY`) rather than cut the reply.
+  An error while stopping sessions or updating does not leave iTerm2 closed: the reopen still runs.
   `--update` reads iTerm2's official appcast, checks the code signature and team id of the download,
   and keeps the old app if the check fails.
 - `claude-restart` writes a marker; the Stop hook sees it at the end of the session's turn and
