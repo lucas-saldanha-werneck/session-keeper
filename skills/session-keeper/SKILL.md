@@ -1,6 +1,8 @@
 ---
 name: session-keeper
 description: Restart the Mac, iTerm2 or one Claude Code session without losing windows or conversations. Use when the user says "restart my Mac without losing my sessions", "save my sessions before I reboot", "reopen my sessions", "restart iTerm", "update iTerm without losing windows", "restart this session so the new config loads", "reload settings/hooks/plugins/MCP", or "clean up empty tmux sessions".
+metadata:
+  author: Lucas Saldanha Werneck <lucas@2olhares.com>
 ---
 
 # session-keeper
@@ -8,6 +10,12 @@ description: Restart the Mac, iTerm2 or one Claude Code session without losing w
 The commands live in `${CLAUDE_PLUGIN_ROOT}/bin/` (or in `~/.local/bin` after `./install.sh`).
 Run them with `python3 "${CLAUDE_PLUGIN_ROOT}/bin/<name>"` for the Python ones and
 `bash "${CLAUDE_PLUGIN_ROOT}/bin/claude-restart"` when they are not on `PATH`.
+
+## Instructions
+
+1. Pick the command from the table by what the user wants.
+2. Run the `--dry-run` form first and show the plan.
+3. Run the real command, following the rules below.
 
 Pick by what the user wants:
 
@@ -32,3 +40,10 @@ Rules:
 5. If a SessionStart message says "Auto-save PAUSED", tell the user first and offer
    `claude-save --reopen --keep-window`.
 6. macOS only for the iTerm parts. Do not run them on other systems.
+
+## Examples
+
+- "restart my Mac without losing my sessions": `claude-save` before the reboot; afterwards, in an iTerm window, `claude-save --reopen`.
+- "restart iTerm": `claude-iterm-restart` (after telling the user it quits iTerm2).
+- "restart this session so the new config loads": `claude-restart --yes` restarts it at the end of the turn.
+- "clean up empty tmux sessions": `claude-tmux-gc --dry-run`, then without `--dry-run`.
