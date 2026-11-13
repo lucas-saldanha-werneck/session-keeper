@@ -8,7 +8,7 @@ security problem.
 
 ## Supported versions
 
-Only the latest release (0.2.10) is supported. Fixes go into a new release.
+Only the latest release (0.2.11) is supported. Fixes go into a new release.
 
 ## What session-keeper accesses
 
