@@ -4,6 +4,7 @@
 [![License](https://img.shields.io/github/license/lucas-saldanha-werneck/session-keeper)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.2.11-blue)](CHANGELOG.md)
 [![session-keeper score](https://img.shields.io/badge/skill%20score-96.2%20A-brightgreen)](https://github.com/NVIDIA/SkillEvaluator)
+[![plugin score (proposal)](https://img.shields.io/badge/plugin%20score%20(proposal)-93.8%20A-brightgreen)](https://github.com/NVIDIA/SkillEvaluator/issues/508)
 
 Restart your Mac, iTerm2, or a single Claude Code session without losing your windows or your
 conversations.
