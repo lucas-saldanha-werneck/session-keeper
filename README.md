@@ -1,7 +1,21 @@
 # session-keeper
 
+[![CI](https://github.com/lucas-saldanha-werneck/session-keeper/actions/workflows/test.yml/badge.svg)](https://github.com/lucas-saldanha-werneck/session-keeper/actions/workflows/test.yml)
+[![License](https://img.shields.io/github/license/lucas-saldanha-werneck/session-keeper)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.2.10-blue)](CHANGELOG.md)
+
 Restart your Mac, iTerm2, or a single Claude Code session without losing your windows or your
 conversations.
+
+[![session-keeper demo: tap to open the video](https://github.com/user-attachments/assets/c6575399-8cc1-4551-95db-89e6d2fdb5a1)](https://lucas-saldanha-werneck.github.io/session-keeper/demo.mp4)
+
+<table>
+<tr>
+<td align="center"><img src="https://github.com/user-attachments/assets/8f40ae0e-07d3-4278-9b9b-0140709de1ce" alt="claude-save listing the open windows, tabs and tmux sessions" width="320"><br>claude-save remembers them</td>
+<td align="center"><img src="https://github.com/user-attachments/assets/961fa53c-0cfc-472b-96b3-eb8e87a84ab9" alt="The windows and chats reopened after a restart" width="320"><br>At login it all comes back</td>
+<td align="center"><img src="https://github.com/user-attachments/assets/aa03798a-a148-4327-9606-72ee952d25dd" alt="The desktop app after the session restarted itself" width="320"><br>A restart from the desktop app</td>
+</tr>
+</table>
 
 With ten Claude Code sessions open across iTerm2 windows and tmux sessions, a reboot or an iTerm2
 update means finding every folder and every conversation id again by hand. session-keeper takes a
@@ -248,6 +262,10 @@ iTerm2 windows in memory). The shell tests run `claude-restart`, `claude-boot-re
 `install.sh` with fake `tmux`, `ps`, `claude`, `osascript` and `launchctl` on `PATH` and a temporary
 `HOME`. Nothing real is restarted. Not tested here: a real reboot, a real iTerm2 quit and update,
 and the desktop app path.
+
+## Security
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## License
 
