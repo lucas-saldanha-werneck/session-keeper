@@ -171,7 +171,7 @@ wait_for "$T/calls" "display dialog"; rm -f "$PEND/quote-test.marker"; wait "$wp
 has "SK-13: the folder is escaped for AppleScript" 'it\"s here' "$(cat "$T/calls")"
 
 echo "== claude-restart in T3 Code"
-T3ENV=(CLAUDE_CODE_ENTRYPOINT=t3-code T3CODE_THREAD_ID=thread-t3-test CLAUDE_CODE_SESSION_ID=$SID)
+T3ENV=(CLAUDE_CODE_ENTRYPOINT=t3-code T3CODE_THREAD_ID=thread-t3-test CLAUDE_CODE_SESSION_ID=$SID SESSION_KEEPER_UNDER_TERMINAL=0)
 : >"$LOG"; : >"$T/tmux-calls"; : >"$T/calls"; echo "work|$T/proj" >"$T/tmux-sessions"
 out="$(cd "$T/proj" && env "${T3ENV[@]}" "$R" 2>&1)"; rc=$?
 has "T3: the plan names the T3 thread" "SESSION  : T3 Code thread thread-t3-test" "$out"
@@ -188,11 +188,20 @@ sleep 0.5
 hasnt "T3: nothing typed into tmux" "respawn-pane" "$(cat "$T/tmux-calls")"
 hasnt "T3: no terminal opened" "DRYRUN would open" "$(cat "$LOG")"
 hasnt "T3: no AppleScript" "osascript" "$(cat "$T/calls")"
-out="$(cd "$T/proj" && env T3CODE_THREAD_ID=thread-t3-test "$R" 2>&1)"
+out="$(cd "$T/proj" && env T3CODE_THREAD_ID=thread-t3-test SESSION_KEEPER_UNDER_TERMINAL=0 "$R" 2>&1)"
 has "T3: the thread id alone is enough" "T3 Code thread thread-t3-test" "$out"
 # a tmux pane that inherited T3's variables (tmux server started from a T3 thread) is a terminal session
 out="$(cd "$T/proj" && env "${T3ENV[@]}" TMUX=/tmp/tmux-1/default,1,0 "$R" 2>&1)"
 has "T3 variables inherited by a tmux pane: tmux plan" "SESSION  : work" "$out"
+out="$(cd "$T/proj" && env "${T3ENV[@]}" TMUX_PANE=%1 "$R" 2>&1)"
+has "T3 variables inherited, TMUX_PANE set: tmux plan (pane wins)" "SESSION  : work" "$out"
+hasnt "T3 variables inherited, TMUX_PANE set: no T3 message" "T3 Code thread" "$out"
+out="$(cd "$T/proj" && env "${T3ENV[@]}" SESSION_KEEPER_UNDER_TERMINAL=1 "$R" 2>&1)"
+has "T3 variables inherited under a tty (robot or terminal): tmux plan" "SESSION  : work" "$out"
+hasnt "T3 variables inherited under a tty: no T3 message" "T3 Code thread" "$out"
+: >"$LOG"; printf 'SESSION=\nTARGET=%q\nRESUME_ID=%q\n' "$T/proj" "$SID" >"$PEND/$SID.marker"
+echo "{\"session_id\": \"$SID\"}" | env "${T3ENV[@]}" TMUX_PANE=%1 CLAUDE_AUTO_RETRY_LAUNCHER="$T/none.js" "$R" --stop-hook
+if wait_for "$LOG" "DRYRUN respawn %1"; then ok "T3 variables inherited by a pane: stop hook still restarts the pane"; else bad "inherited T3 vars in a pane: stop hook" "$(cat "$LOG")"; fi
 # a restart scheduled from elsewhere for a T3 session is dropped at the end of its turn, not fired
 : >"$LOG"
 printf 'SESSION=\nTARGET=%q\nRESUME_ID=%q\n' "$T/proj" "$SID" >"$PEND/$SID.marker"

@@ -89,12 +89,16 @@ under_terminal() {
 
 # True when this runs inside a T3 Code thread (github.com/pingdotgg/t3code). T3 Code runs claude in SDK
 # mode (stream-json over pipes, no terminal) and owns that process: it stops an idle thread's claude by
-# itself and starts it again with --resume on the next message. A tmux pane is a terminal even when it
-# inherited T3's variables (a tmux server started from a T3 thread keeps them for every pane).
+# itself and starts it again with --resume on the next message. Its variables are INHERITED by children
+# (a tmux server started from a T3 thread keeps them for every pane; robots started from a thread), so the
+# same rule as for an inherited claude-desktop entrypoint applies: a terminal (tmux pane or a tty above
+# this process) wins. If T3 Code itself runs under a terminal this says no, and the SDK-mode check
+# (sdk_hosted_pid) still keeps the restart from stopping T3's claude.
 in_t3_code() {
   [[ -n "${SESSION_KEEPER_IN_T3:-}" ]] && { [[ "$SESSION_KEEPER_IN_T3" == 1 ]]; return; }
   [[ "${CLAUDE_CODE_ENTRYPOINT:-}" == t3-code || -n "${T3CODE_THREAD_ID:-}" ]] || return 1
-  [[ -z "${TMUX:-}" ]]
+  [[ -z "${TMUX:-}" && -z "${TMUX_PANE:-}" ]] || return 1
+  ! under_terminal
 }
 
 # True when pid is a claude that another program drives in SDK mode (T3 Code, an IDE, a script). Its input
