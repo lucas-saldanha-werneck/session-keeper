@@ -56,7 +56,8 @@ chmod +x "$FAKE"/*
 export FAKE_DIR="$T" HOME="$T/home" CLAUDE_CONFIG_DIR="$T/claude" SESSION_KEEPER_CONFIG="$T/none"
 export PATH="$FAKE:$PATH" CLAUDE_RESTART_DRYRUN=1 CLAUDE_RESTART_POLL=1 CLAUDE_RESTART_FIRE_DELAY=0
 export SESSION_KEEPER_TMUX="$FAKE/tmux" SESSION_KEEPER_ITERM_APP="$T/no-iTerm.app"
-unset TMUX_PANE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID CLAUDE_CODE_HOST_SESSION_ID SESSION_KEEPER_TMUX_PREFIX || true
+unset TMUX TMUX_PANE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID CLAUDE_CODE_HOST_SESSION_ID SESSION_KEEPER_TMUX_PREFIX \
+  T3CODE_THREAD_ID T3CODE_CLI_PATH SESSION_KEEPER_IN_T3 || true
 R="$ROOT/bin/claude-restart"
 LOG="$T/claude/restart-pending/restart.log"
 
@@ -168,6 +169,53 @@ SESSION_KEEPER_ASSUME_MACOS=1 "$R" --watch quote-test 0 &
 wpid=$!
 wait_for "$T/calls" "display dialog"; rm -f "$PEND/quote-test.marker"; wait "$wpid" 2>/dev/null
 has "SK-13: the folder is escaped for AppleScript" 'it\"s here' "$(cat "$T/calls")"
+
+echo "== claude-restart in T3 Code"
+T3ENV=(CLAUDE_CODE_ENTRYPOINT=t3-code T3CODE_THREAD_ID=thread-t3-test CLAUDE_CODE_SESSION_ID=$SID)
+: >"$LOG"; : >"$T/tmux-calls"; : >"$T/calls"; echo "work|$T/proj" >"$T/tmux-sessions"
+out="$(cd "$T/proj" && env "${T3ENV[@]}" "$R" 2>&1)"; rc=$?
+has "T3: the plan names the T3 thread" "SESSION  : T3 Code thread thread-t3-test" "$out"
+has "T3: the plan says how config loads there" "send the next message" "$out"
+hasnt "T3: never picks the tmux session" "SESSION  : work" "$out"
+[[ $rc -eq 0 ]] && ok "T3: plan exits 0" || bad "T3: plan exits 0" "rc=$rc"
+out="$(cd "$T/proj" && env "${T3ENV[@]}" "$R" --yes 2>&1)"; rc=$?
+[[ $rc -eq 3 ]] && ok "T3: --yes refuses with exit 3" || bad "T3: --yes refuses with exit 3" "rc=$rc"
+has "T3: --yes says nothing was scheduled" "not scheduled - this session runs in T3 Code" "$out"
+out="$(cd "$T/proj" && env "${T3ENV[@]}" "$R" --yes --now 2>&1)"; rc=$?
+[[ $rc -eq 3 ]] && ok "T3: --now refuses with exit 3" || bad "T3: --now refuses with exit 3" "rc=$rc"
+sleep 0.5
+[[ -z "$(ls "$PEND" 2>/dev/null | grep -E '\.(marker|firing)$')" ]] && ok "T3: no marker written" || bad "T3: no marker written" "$(ls "$PEND")"
+hasnt "T3: nothing typed into tmux" "respawn-pane" "$(cat "$T/tmux-calls")"
+hasnt "T3: no terminal opened" "DRYRUN would open" "$(cat "$LOG")"
+hasnt "T3: no AppleScript" "osascript" "$(cat "$T/calls")"
+out="$(cd "$T/proj" && env T3CODE_THREAD_ID=thread-t3-test "$R" 2>&1)"
+has "T3: the thread id alone is enough" "T3 Code thread thread-t3-test" "$out"
+# a tmux pane that inherited T3's variables (tmux server started from a T3 thread) is a terminal session
+out="$(cd "$T/proj" && env "${T3ENV[@]}" TMUX=/tmp/tmux-1/default,1,0 "$R" 2>&1)"
+has "T3 variables inherited by a tmux pane: tmux plan" "SESSION  : work" "$out"
+# a restart scheduled from elsewhere for a T3 session is dropped at the end of its turn, not fired
+: >"$LOG"
+printf 'SESSION=\nTARGET=%q\nRESUME_ID=%q\n' "$T/proj" "$SID" >"$PEND/$SID.marker"
+echo "{\"session_id\": \"$SID\"}" | env "${T3ENV[@]}" "$R" --stop-hook
+sleep 0.5
+[[ ! -e "$PEND/$SID.marker" && ! -e "$PEND/$SID.firing" ]] && ok "T3: stop hook drops the marker" || bad "T3: stop hook drops the marker"
+has "T3: stop hook logs why" "runs in T3 Code; dropped its restart" "$(cat "$LOG")"
+hasnt "T3: stop hook does not fire" "DRYRUN" "$(cat "$LOG")"
+# from a terminal, a conversation whose live claude is driven in SDK mode (T3 Code) is not restarted
+: >"$LOG"; : >"$T/tmux-sessions"
+printf '100 1 -zsh\n400 1 /usr/local/bin/claude --output-format stream-json --input-format stream-json --resume=%s\n' "$SID" >"$T/ps"
+echo "[{\"pid\": 400, \"sessionId\": \"$SID\"}]" >"$T/agents.json"
+touch "$T/claude/projects/$SLUG/$SID.jsonl"
+out="$(cd "$T/proj" && "$R" --yes --now 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "SDK-driven claude: refused from a terminal" "driven by another program in SDK mode" "$out" || bad "SDK-driven claude: refused" "rc=$rc $out"
+[[ ! -e "$PEND/$SID.marker" && ! -e "$PEND/$SID.firing" ]] && ok "SDK-driven claude: no marker" || bad "SDK-driven claude: no marker"
+printf 'SESSION=\nTARGET=%q\nRESUME_ID=%q\nOLD_PID=400\n' "$T/proj" "$SID" >"$PEND/$SID.firing"
+"$R" --fire "$PEND/$SID.firing"
+has "SDK-driven claude: --fire does not stop it" "driven by another program (SDK mode" "$(cat "$LOG")"
+hasnt "SDK-driven claude: --fire opens nothing" "DRYRUN would" "$(cat "$LOG")"
+printf '100 1 -zsh\n200 100 /usr/local/bin/claude --remote-control\n' >"$T/ps"
+echo "[{\"pid\": 200, \"sessionId\": \"$SID\"}]" >"$T/agents.json"
+touch -t 202001010000 "$T/claude/projects/$SLUG/$SID.jsonl"
 
 start=$(date +%s); echo '{}' | "$R" --stop-hook; [[ $(( $(date +%s) - start )) -le 1 ]] && ok "stop hook fast path with nothing scheduled" || bad "stop hook fast path"
 out="$("$R" --bogus 2>&1)"; rc=$?

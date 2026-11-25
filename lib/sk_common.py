@@ -168,11 +168,11 @@ def run(cmd, **kw):
         return subprocess.CompletedProcess(cmd, 127, "", f"{cmd[0]}: {e}")
 
 
-# Variables a Claude Code session (desktop app, IDE or CLI) sets in its children. When a command run from
+# Variables a Claude Code session (desktop app, T3 Code, IDE or CLI) sets in its children. When a command run from
 # inside such a session starts the tmux server or a new Claude, they leak: the tmux server keeps them in its
 # global environment and every later pane looks like that session (e.g. CLAUDE_CODE_ENTRYPOINT=claude-desktop
 # makes tools think a terminal session is an app session). Names in SESSION_KEEPER_KEEP_ENV are kept.
-APP_ENV_PREFIXES = ("CLAUDE_CODE_", "CLAUDE_AGENT_SDK_")
+APP_ENV_PREFIXES = ("CLAUDE_CODE_", "CLAUDE_AGENT_SDK_", "T3CODE_")
 APP_ENV_NAMES = {"CLAUDECODE", "CLAUDE_PID", "CLAUDE_PLUGIN_DATA", "CLAUDE_PLUGIN_ROOT", "CLAUDE_EFFORT",
                  "CLAUDE_PREVIEW_CLASSIFIER_FLOOR", "CLAUDE_JOB_DIR"}
 DEFAULT_KEEP_ENV = "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS CLAUDE_CODE_DISABLE_NOTIFICATION_PRESENCE_CHECK"

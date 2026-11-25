@@ -1,7 +1,7 @@
 ---
 name: session-keeper
 description: Restart the Mac, iTerm2 or one Claude Code session without losing windows or conversations. Use when the user says "restart the Mac without losing the sessions", "save the sessions before a reboot", "reopen the sessions", "restart iTerm", "update iTerm without losing windows", "restart this session so the new config loads", "reload settings/hooks/plugins/MCP", or "clean up empty tmux sessions".
-version: "0.2.11"
+version: "0.2.12"
 metadata:
   author: Lucas Saldanha Werneck <lucas@2olhares.com>
   tags: [restart, sessions, iterm2, tmux]
@@ -46,6 +46,9 @@ Rules:
 5. If a SessionStart message says "Auto-save PAUSED", tell the user first and offer
    `claude-save --reopen --keep-window`.
 6. macOS only for the iTerm parts. Do not run them on other systems.
+7. Inside T3 Code (`CLAUDE_CODE_ENTRYPOINT=t3-code`), `claude-restart --yes` refuses (exit 3): tell the
+   user to leave the thread idle for a few minutes and send the next message, which resumes it with the
+   new config. Never restart a T3 Code session through tmux, iTerm or the desktop app.
 
 ## Prerequisites
 
