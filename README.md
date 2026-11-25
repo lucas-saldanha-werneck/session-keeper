@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/lucas-saldanha-werneck/session-keeper/actions/workflows/test.yml/badge.svg)](https://github.com/lucas-saldanha-werneck/session-keeper/actions/workflows/test.yml)
 [![License](https://img.shields.io/github/license/lucas-saldanha-werneck/session-keeper)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.2.11-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.2.12-blue)](CHANGELOG.md)
 [![session-keeper score](https://img.shields.io/badge/skill%20score-96.2%20A-brightgreen)](https://github.com/NVIDIA/SkillEvaluator)
 [![plugin score (proposal)](https://img.shields.io/badge/plugin%20score%20(proposal)-93.8%20A-brightgreen)](https://github.com/NVIDIA/SkillEvaluator/issues/508)
 
@@ -201,6 +201,10 @@ None of these are needed for the rest to work.
   session when installed; otherwise plain `claude --resume`.
 - **The Claude desktop app**: `claude-restart` run from inside an app session stops only that
   session's process; the next message you send resumes it with the new config.
+- **[T3 Code](https://github.com/pingdotgg/t3code)**: T3 Code owns the claude process of its threads, so
+  `claude-restart` run inside a T3 Code thread does not stop it (`--yes` / `--now` exit 3). T3 Code
+  already stops an idle thread's claude after a short time and resumes it with `--resume` on the next
+  message, which loads the new config; the command prints these steps.
 - **zsh**: needed to put a program's command back at the prompt. Other shells get a reminder line.
 
 ## Platform

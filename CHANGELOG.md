@@ -2,6 +2,9 @@
 
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.2.12] - 2026-11-25
+- T3 Code: `claude-restart` run inside a T3 Code thread schedules nothing (T3 Code owns the claude process and resumes idle sessions by itself) and explains how the new config loads there; `--yes` / `--now` exit 3. T3 variables inherited by a tmux pane or a process under a terminal do not count (the terminal wins). The Stop hook drops a restart marked for a T3 Code session, and a conversation whose claude is driven in SDK mode is never stopped or reopened in a terminal. `T3CODE_*` variables no longer leak into tmux sessions it starts.
+
 ## [0.2.11] - 2026-11-13
 - Skill schema and score: version and tags in the frontmatter, third-person description, Purpose, Prerequisites, Limitations and Troubleshooting sections; skill score badge.
 - README: demo video and badges; adds SECURITY.md.

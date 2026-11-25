@@ -17,6 +17,9 @@
 #   claude-restart --pending                  scheduled restarts
 #   claude-restart --cancel [folder]          cancel the one scheduled for that folder
 #
+# T3 Code: run FROM INSIDE a T3 Code thread, it schedules nothing (T3 Code owns the claude process and
+# resumes idle sessions by itself); it prints how the new config loads there. --yes / --now exit 3.
+#
 # Desktop app: run FROM INSIDE a desktop app session, the same command marks MODE=app. At the end of
 # the turn claude-restart-app stops only that session's claude process (no UI is touched); the next
 # message starts a new process with --resume of the same id.
@@ -84,6 +87,44 @@ under_terminal() {
   return 1
 }
 
+# True when this runs inside a T3 Code thread (github.com/pingdotgg/t3code). T3 Code runs claude in SDK
+# mode (stream-json over pipes, no terminal) and owns that process: it stops an idle thread's claude by
+# itself and starts it again with --resume on the next message. Its variables are INHERITED by children
+# (a tmux server started from a T3 thread keeps them for every pane; robots started from a thread), so the
+# same rule as for an inherited claude-desktop entrypoint applies: a terminal (tmux pane or a tty above
+# this process) wins. If T3 Code itself runs under a terminal this says no, and the SDK-mode check
+# (sdk_hosted_pid) still keeps the restart from stopping T3's claude.
+in_t3_code() {
+  [[ -n "${SESSION_KEEPER_IN_T3:-}" ]] && { [[ "$SESSION_KEEPER_IN_T3" == 1 ]]; return; }
+  [[ "${CLAUDE_CODE_ENTRYPOINT:-}" == t3-code || -n "${T3CODE_THREAD_ID:-}" ]] || return 1
+  [[ -z "${TMUX:-}" && -z "${TMUX_PANE:-}" ]] || return 1
+  ! under_terminal
+}
+
+# True when pid is a claude that another program drives in SDK mode (T3 Code, an IDE, a script). Its input
+# is that program's pipe: it cannot be reopened in a terminal without running the conversation twice.
+sdk_hosted_pid() {
+  local c
+  [[ "${1:-}" =~ ^[0-9]+$ ]] || return 1
+  c="$(ps -ww -o args= -p "$1" 2>/dev/null || true)"
+  [[ "$c" == *"--input-format stream-json"* || "$c" == *"--input-format=stream-json"* ]]
+}
+
+t3_explain() {  # $1 = folder
+  say "FOLDER   : $1"
+  say "SESSION  : T3 Code thread ${T3CODE_THREAD_ID:-(id unknown)}"
+  say
+  say "Nothing to schedule: T3 Code owns this session's claude process. Stopping it from here would not"
+  say "bring it back inside T3, and reopening it in a terminal would run the same conversation twice."
+  say
+  say "How new config loads in T3 Code:"
+  say "  1. let this thread sit idle: T3 Code stops its claude process by itself after a short idle time"
+  say "     (2 min in T3 Code 0.1.12; longer while subagents or background tasks are still running)"
+  say "  2. send the next message: T3 Code starts claude again with --resume, so the new settings, hooks,"
+  say "     plugins and MCP servers load and the conversation is kept"
+  say "  Other ways: start a new thread (fresh context), or quit and reopen T3 Code (stops every thread)."
+}
+
 hook_registered() {
   grep -qE 'claude-restart[\\"]* --stop-hook' "$CLAUDE_DIR/settings.json" 2>/dev/null && return 0
   grep -q 'session-keeper' "$CLAUDE_DIR/plugins/installed_plugins.json" 2>/dev/null && return 0
@@ -94,7 +135,7 @@ scrub_app_env() {  # same list as scrub_app_env() in lib/sk_common.py; SESSION_K
   local v keep=" ${SESSION_KEEPER_KEEP_ENV:-CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS CLAUDE_CODE_DISABLE_NOTIFICATION_PRESENCE_CHECK} "
   for v in $(compgen -e); do
     case "$v" in
-      CLAUDE_CODE_*|CLAUDE_AGENT_SDK_*|CLAUDECODE|CLAUDE_PID|CLAUDE_PLUGIN_DATA|CLAUDE_PLUGIN_ROOT|CLAUDE_EFFORT|CLAUDE_PREVIEW_CLASSIFIER_FLOOR|CLAUDE_JOB_DIR)
+      CLAUDE_CODE_*|CLAUDE_AGENT_SDK_*|T3CODE_*|CLAUDECODE|CLAUDE_PID|CLAUDE_PLUGIN_DATA|CLAUDE_PLUGIN_ROOT|CLAUDE_EFFORT|CLAUDE_PREVIEW_CLASSIFIER_FLOOR|CLAUDE_JOB_DIR)
         [[ "$keep" == *" $v "* ]] || unset "$v" ;;
     esac
   done
@@ -173,6 +214,13 @@ for x in (d.get("session_id") or "", t):
   for id in $ids; do
     M="$PEND/$id.marker"
     [[ -f "$M" ]] || continue
+    if in_t3_code; then
+      # T3 Code restarts its idle sessions by itself; stopping this one would leave the thread without its
+      # process and reopen the conversation outside T3.
+      rm -f "$M"
+      log "stop-hook: $id runs in T3 Code; dropped its restart (T3 Code resumes idle sessions by itself)"
+      break
+    fi
     F="$PEND/$id.firing"
     mv "$M" "$F" 2>/dev/null || continue
     if grep -qx 'MODE=app' "$F"; then
@@ -252,6 +300,10 @@ if [[ "${1:-}" == "--fire" ]]; then
     log "fire: respawn-pane failed in $PANE; falling back to a new window"
   fi
   # Fallback: the tmux session is gone (or there never was one) -> stop what is left and open a new window.
+  if sdk_hosted_pid "${OLD_PID:-}"; then
+    log "fire: $RESUME_ID runs in claude pid $OLD_PID, driven by another program (SDK mode, e.g. T3 Code); not restarted"
+    exit 0
+  fi
   if [[ -n "$SESSION" ]]; then tmx kill-session -t "=$SESSION" 2>/dev/null || true; fi
   stop_claude_pid "${OLD_PID:-}"
   log "fire: killed ${SESSION:-?}; reopening $RESUME_ID in $TARGET (new window)"
@@ -343,6 +395,19 @@ if [[ "$CANCEL" == yes ]]; then
   done
   log "cancel: $n marker(s) removed for $TARGET"
   say "cancelled: $n scheduled restart(s) for $TARGET"
+  exit 0
+fi
+
+# ===== T3 Code: run FROM INSIDE a T3 Code thread =====
+# T3 Code owns the claude process and already restarts idle sessions with --resume, so nothing is stopped
+# here: the plan explains how the new config loads, and --yes / --now refuse (exit 3).
+if in_t3_code; then
+  t3_explain "$TARGET"
+  if [[ "$CONFIRM" == yes || "$NOW" == yes ]]; then
+    log "refused: T3 Code thread ${T3CODE_THREAD_ID:-?} in $TARGET"
+    say "claude-restart: not scheduled - this session runs in T3 Code (see above)." >&2
+    exit 3
+  fi
   exit 0
 fi
 
@@ -487,6 +552,11 @@ for a in d:
 ' "$RESUME_ID" 2>/dev/null || true)"
 fi
 
+if sdk_hosted_pid "$OLD_PID"; then
+  say "FOLDER   : $TARGET"
+  say "RESUME ID: $RESUME_ID   (last write: $AGE)"
+  die "this conversation runs in claude pid $OLD_PID, driven by another program in SDK mode (e.g. T3 Code). Restart it from that program; nothing was scheduled."
+fi
 say "FOLDER   : $TARGET"
 say "SESSION  : ${SESSION:-(no tmux session open in this folder)}"
 say "RESUME ID: $RESUME_ID   (last write: $AGE)"
